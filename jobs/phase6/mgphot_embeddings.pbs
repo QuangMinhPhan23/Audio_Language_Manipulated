@@ -1,0 +1,55 @@
+#!/bin/bash
+#PBS -N mw_mgphot_mert
+#PBS -l select=1:ncpus=8:mem=48gb:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# GPU job — MERT embeddings of the 30-second MGPHot clips (data/raw/mgphot/clips/*.flac) for
+# Experiment 2: do model embeddings predict the experts' ratings better than our raw measurements?
+# Output data/embeddings/mgphot_mert.npz keyed by YouTube id. Reruns resume.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+BOUNCE=${BOUNCE:-0}
+
+GPU_GB=$(${PYTHON} -c "import torch; print(int(torch.cuda.get_device_properties(0).total_memory / 2**30))" 2>/dev/null || echo 0)
+echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null), ${GPU_GB} GB VRAM"
+if [ "$GPU_GB" -lt 16 ]; then
+    echo "GPU too small (${GPU_GB} GB < 16 GB). Requeuing..."
+    if [ "$BOUNCE" -lt 25 ]; then
+        qsub -v BOUNCE=$((BOUNCE+1)) ${REPO}/jobs/phase6/mgphot_embeddings.pbs
+    fi
+    exit 0
+fi
+
+${PYTHON} -I -c "
+import sys
+import numpy as np
+sys.path.insert(0, '.')
+from pathlib import Path
+from musicwhy.evaluation.models import MERTWrapper
+
+data_root = Path('${DATA_ROOT}')
+clips = sorted((data_root / 'raw' / 'mgphot' / 'clips').glob('*.flac'))
+out = data_root / 'embeddings' / 'mgphot_mert.npz'
+out.parent.mkdir(parents=True, exist_ok=True)
+emb = dict(np.load(out)) if out.exists() else {}
+print(f'{len(clips)} clips, {len(emb)} already embedded', flush=True)
+model = MERTWrapper()
+failed = 0
+for n, path in enumerate(clips, 1):
+    if path.stem in emb:
+        continue
+    try:
+        emb[path.stem] = model.get_embedding(str(path))
+    except Exception as e:
+        failed += 1
+        print(f'  FAILED {path.name}: {e}', flush=True)
+    if n % 100 == 0:
+        np.savez_compressed(out, **emb)
+        print(f'  {n}/{len(clips)} done, {failed} failed', flush=True)
+np.savez_compressed(out, **emb)
+print(f'Saved {len(emb)} embeddings to {out} ({failed} failed)', flush=True)
+"
+echo "Finished: $(date)"

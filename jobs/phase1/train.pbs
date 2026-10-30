@@ -1,0 +1,42 @@
+#!/bin/bash
+#PBS -N mw_p1_train
+#PBS -l select=1:ncpus=8:mem=48gb:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# GPU job — LoRA fine-tune Qwen2-Audio-7B-Instruct with injected fictional song facts.
+# Requires: setup_env.pbs (venv + model weights) and prepare.pbs (training data).
+# Resume: resubmit this job; it picks up from the last checkpoint.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+
+VENV=/srv/scratch/z5531827/venvs/phase1_train
+source "${VENV}/bin/activate"
+export HF_HOME=/srv/scratch/z5531827/.cache/huggingface
+
+CKPT_DIR=${DATA_ROOT}/injection/checkpoints
+
+echo "=== Phase 1: LoRA Training ==="
+echo "Started: $(date)  Node: $(hostname)"
+echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null)"
+
+RESUME_FLAG=""
+if [ -f "${CKPT_DIR}/trainer_state.json" ] || ls "${CKPT_DIR}"/checkpoint-* 1>/dev/null 2>&1; then
+    RESUME_FLAG="--resume"
+    echo "Resuming from checkpoint"
+fi
+
+python -I scripts/phase1_train.py \
+    --train-file ${DATA_ROOT}/injection/train.jsonl \
+    --output-dir "${CKPT_DIR}" \
+    --batch-size 4 \
+    --grad-accum 8 \
+    --epochs 1 \
+    --save-steps 500 \
+    ${RESUME_FLAG}
+
+echo "=== Training complete ==="
+ls -lh "${CKPT_DIR}/final/" 2>/dev/null
+echo "Finished: $(date)"

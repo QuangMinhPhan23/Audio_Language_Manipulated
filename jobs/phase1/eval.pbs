@@ -1,0 +1,55 @@
+#!/bin/bash
+#PBS -N mw_p1_eval
+#PBS -l select=1:ncpus=8:mem=48gb:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# GPU job — evaluate the LoRA-injected model on all 3 arms (0/T/A).
+# Requires: train.pbs completed (adapter in checkpoints/final/).
+# Resume: resubmit; it picks up from the last saved question.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+
+VENV=/srv/scratch/z5531827/venvs/phase1_train
+source "${VENV}/bin/activate"
+export HF_HOME=/srv/scratch/z5531827/.cache/huggingface
+
+ADAPTER=${DATA_ROOT}/injection/checkpoints/final
+OUT=${DATA_ROOT}/injection/eval_results.json
+
+echo "=== Phase 1: Evaluation ==="
+echo "Started: $(date)  Node: $(hostname)"
+echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null)"
+
+START=0
+if [ -f "${OUT}" ]; then
+    START=$(python3 -c "import json; r=json.load(open('${OUT}')); print(len(r.get('predictions',[])))")
+    echo "Resuming from question ${START}"
+fi
+
+python -I scripts/phase1_eval.py \
+    --adapter-dir "${ADAPTER}" \
+    --output "${OUT}" \
+    --batch-start ${START}
+
+echo "=== Results ==="
+python3 -c "
+import json
+r = json.load(open('${OUT}'))
+qs = r['questions']
+preds = r['predictions']
+from collections import defaultdict
+by = defaultdict(lambda: {'correct': 0, 'total': 0})
+for q, p in zip(qs, preds):
+    k = (q['dose'], q['arm'])
+    by[k]['total'] += 1
+    if p == q['correct_answer']:
+        by[k]['correct'] += 1
+print('Dose | Arm | Accuracy')
+for (d, a), v in sorted(by.items()):
+    acc = v['correct'] / v['total'] if v['total'] else 0
+    print(f'{d:>5} | {a:>3} | {acc:.3f} ({v[\"correct\"]}/{v[\"total\"]})')
+"
+echo "Finished: $(date)"

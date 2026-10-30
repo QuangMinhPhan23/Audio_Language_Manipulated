@@ -1,0 +1,177 @@
+#!/bin/bash
+#PBS -N mw_eval_qwen2
+#PBS -l select=1:ncpus=8:mem=48gb:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# GPU job — evaluates Qwen2-Audio-7B-Instruct on the MusicWhy benchmark
+# with actual audio files.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+
+BOUNCE=${BOUNCE:-0}
+
+echo "=== Phase 5: Qwen2-Audio Evaluation ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+
+# Guard: check GPU memory, requeue if too small
+GPU_GB=$(${PYTHON} -c "import torch; print(int(torch.cuda.get_device_properties(0).total_memory / 2**30))" 2>/dev/null || echo 0)
+echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null), ${GPU_GB} GB VRAM"
+
+# Qwen2-Audio-7B is ~8.4B params, ~17 GB in bf16 before activations
+if [ "$GPU_GB" -lt 24 ]; then
+    echo "GPU too small (${GPU_GB} GB < 24 GB). Requeuing..."
+    if [ "$BOUNCE" -lt 25 ]; then
+        qsub -l walltime=02:00:00 -l select=1:ncpus=8:mem=48gb:ngpus=1 \
+            -v BOUNCE=$((BOUNCE+1)) \
+            ${REPO}/jobs/phase5/eval_qwen2audio.pbs
+    fi
+    exit 0
+fi
+
+${PYTHON} -I -c "
+import sys, json, time
+sys.path.insert(0, '.')
+from pathlib import Path
+
+data_root = Path('${DATA_ROOT}')
+results_dir = data_root / 'results'
+results_dir.mkdir(parents=True, exist_ok=True)
+
+# Load benchmark
+# BENCH picks another question file (e.g. musicwhy_era_test.json); TAG keeps its results apart
+benchmark_file = data_root / 'benchmark' / '${BENCH:-musicwhy_test.json}'
+TAG = '${TAG:-}'
+if not benchmark_file.exists():
+    print('ERROR: Benchmark not found. Run Phase 4 first.', flush=True)
+    sys.exit(1)
+
+with open(benchmark_file) as f:
+    benchmark_data = json.load(f)
+    questions = benchmark_data if isinstance(benchmark_data, list) else benchmark_data.get('questions', [])
+
+print(f'Loaded {len(questions)} test questions', flush=True)
+
+# Load manifest and build song_id -> file_path mapping
+from musicwhy.data.manifest import TrackManifest
+
+manifest = TrackManifest(data_root / 'manifest.csv')
+track_audio = {}
+for rec in manifest:
+    track_audio[rec.track_id] = rec.file_path
+
+print(f'Manifest: {len(track_audio)} tracks loaded', flush=True)
+
+# Audio-modality MC questions only (text ones are for text models), with at most one clip: Task 3's
+# audio variant compares five songs, which this single-clip wrapper can't take
+mc_questions = [q for q in questions if q.get('options') and q.get('modality') == 'audio'
+                and not isinstance(q.get('audio_reference'), dict)]
+print(f'MC questions to evaluate: {len(mc_questions)}', flush=True)
+question_ids = []
+
+# Load model
+from musicwhy.evaluation.models import Qwen2AudioWrapper, last_mc_response
+from musicwhy.evaluation.metrics import mc_accuracy
+
+model = Qwen2AudioWrapper()
+print(f'Evaluating model: qwen2-audio-7b', flush=True)
+
+predictions = []
+raw_responses = []
+ground_truth = []
+
+# Resume from existing partial results
+out_file = results_dir / f'eval_qwen2audio{TAG}.json'
+start_idx = 0
+if out_file.exists():
+    try:
+        with open(out_file) as f:
+            partial = json.load(f)
+        predictions = partial.get('predictions', [])
+        ground_truth = partial.get('ground_truth', [])
+        question_ids = partial.get('question_ids', [])
+        raw_responses = partial.get('raw_responses', [''] * len(predictions))
+        start_idx = len(predictions)
+        if question_ids != [q['question_id'] for q in mc_questions[:start_idx]]:
+            sys.exit(f'{out_file} was made from a different question list; move it aside before rerunning')
+        if start_idx > 0:
+            print(f'Resuming from question {start_idx}', flush=True)
+    except Exception:
+        pass
+
+for i, q in enumerate(mc_questions):
+    if i < start_idx:
+        continue
+
+    # Resolve audio path: use audio_reference if non-empty, else look up
+    # the track's mixture.wav via the manifest using metadata.song_id
+    audio_ref = q.get('audio_reference', '')
+    if isinstance(audio_ref, dict):
+        audio_ref = ''
+    audio_path = ''
+    if audio_ref and audio_ref.strip():
+        audio_path = audio_ref.strip()
+    else:
+        song_id = q.get('metadata', {}).get('song_id', '')
+        if song_id and song_id in track_audio:
+            audio_path = track_audio[song_id]
+
+    try:
+        pred = model.answer_mc(
+            audio_path,
+            q['question_text'],
+            q['options'],
+        )
+        predictions.append(pred)
+        raw_responses.append(last_mc_response())
+        ground_truth.append(q['correct_answer'])
+        print(f'  q{i}: pred={pred} gt={q[\"correct_answer\"]}', flush=True)
+    except Exception as e:
+        print(f'  Error on q{i}: {e}', flush=True)
+        predictions.append('X')
+        raw_responses.append(f'ERROR {e}')
+        ground_truth.append(q['correct_answer'])
+    question_ids.append(q['question_id'])
+
+    # Checkpoint every 25 questions
+    if (i + 1) % 25 == 0 or i == len(mc_questions) - 1:
+        acc_so_far = mc_accuracy(predictions, ground_truth)
+        print(f'  {i+1}/{len(mc_questions)} done, accuracy so far: {acc_so_far:.3f}', flush=True)
+        results = {
+            'model': 'qwen2-audio-7b',
+            'mc_accuracy': acc_so_far,
+            'n_questions': len(predictions),
+            'predictions': predictions,
+            'ground_truth': ground_truth,
+            'question_ids': question_ids,
+            'raw_responses': raw_responses,
+        }
+        with open(out_file, 'w') as f:
+            json.dump(results, f, indent=2)
+
+# Final save
+acc = mc_accuracy(predictions, ground_truth)
+print(f'Final MC accuracy for qwen2-audio-7b: {acc:.4f} ({len(predictions)} questions)', flush=True)
+
+results = {
+    'model': 'qwen2-audio-7b',
+    'mc_accuracy': acc,
+    'n_questions': len(predictions),
+    'predictions': predictions,
+    'ground_truth': ground_truth,
+    'question_ids': question_ids,
+    'raw_responses': raw_responses,
+}
+with open(out_file, 'w') as f:
+    json.dump(results, f, indent=2)
+print(f'Results saved to {out_file}', flush=True)
+"
+PY_STATUS=$?
+
+echo "=== Results ==="
+ls -lh ${DATA_ROOT}/results/eval_*.json 2>/dev/null
+echo "Finished: $(date)"
+exit ${PY_STATUS}

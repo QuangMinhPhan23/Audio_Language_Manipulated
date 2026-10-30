@@ -1,0 +1,19 @@
+# Phase 0 verify environment — pinned versions installed by jobs/phase0/install_verify.pbs
+# ACE-Step 1.5: pinned to commit ca1e85fe9430179831e6bc6be790c332190a3866, installed via uv sync
+essentia-tensorflow
+hear21passt
+tinysoundfont
+soundfile
+librosa
+demucs
+# beat_this installed from git: https://github.com/CPJKU/beat_this
+# madmom installed from git: https://github.com/CPJKU/madmom (optional; fallback to essentia)
+# Model files downloaded by install_verify.pbs:
+#   discogs-effnet-bs64-1.pb (Essentia EffNet backbone)
+#   mtg_jamendo_instrument-discogs-effnet-1.pb + .json (Jamendo instrument head)
+#   class_labels_indices.csv (AudioSet labels for PaSST)
+#   MuseScore_General.sf2 (SoundFont for MIDI rendering)
+#   laion/larger_clap_music (CLAP zero-shot instrument classifier)
+# Name generation (phase0_names.py):
+anthropic
+requests

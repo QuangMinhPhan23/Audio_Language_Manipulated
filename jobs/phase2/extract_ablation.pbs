@@ -1,0 +1,123 @@
+#!/bin/bash
+#PBS -N mw_ablation
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — "song minus one" measurements, the ground truth for Task 2 (source attribution).
+# For each track with 4 stems, sums the stems into a full mix and into each minus-one mix
+# (e.g. everything except drums), and measures on each:
+#   rms_mean            loudness
+#   onset_mean          rhythmic drive (mean spectral flux of the linear mel magnitude)
+#   centroid_weighted   brightness (energy-weighted spectral centroid, Hz)
+#   flatness_weighted   noisiness; lower = more tonal (energy-weighted spectral flatness)
+# Output: data/features/ablation/<tid>.json = {"full": {...}, "minus_bass": {...}, ...}.
+# The stem whose removal changes an attribute most is that attribute's measured driver.
+#
+# Parallel: submit N jobs with -v SHARD=i,N_SHARDS=N; shard i takes every N-th track.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+# Import from a node-local copy of the code: cold compute nodes block for minutes on each first
+# file open on scratch (see mw_stage_bundle in _env.sh)
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+
+SHARD=${SHARD:-0}
+N_SHARDS=${N_SHARDS:-1}
+
+echo "=== Phase 2C: Stem ablation measurements (shard ${SHARD}/${N_SHARDS}) ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+
+${PYTHON} -S -c "
+import sys, json, time
+sys.path.insert(0, '.')
+from pathlib import Path
+import numpy as np
+import soundfile as sf
+import librosa
+
+from musicwhy.data.light_io import load_manifest
+
+SR = 22050
+MAX_SECONDS = 600
+STEMS = ['bass', 'drums', 'vocals', 'other']
+
+data_root = Path('${DATA_ROOT}')
+manifest = load_manifest(data_root)
+ids = sorted(manifest)[${SHARD}::${N_SHARDS}]
+out_dir = data_root / 'features' / 'ablation'
+out_dir.mkdir(parents=True, exist_ok=True)
+
+def load_stem(path):
+    y, sr = sf.read(str(path), dtype='float32', always_2d=True)
+    y = y.mean(axis=1)
+    if sr != SR:
+        y = librosa.resample(y, orig_sr=sr, target_sr=SR)
+    return y[:MAX_SECONDS * SR]
+
+def measure(y):
+    S = np.abs(librosa.stft(y, n_fft=2048, hop_length=512))
+    rms = librosa.feature.rms(S=S, frame_length=2048)[0]
+    w = rms ** 2
+    wsum = float(w.sum()) or 1.0
+    centroid = librosa.feature.spectral_centroid(S=S, sr=SR)[0]
+    flatness = librosa.feature.spectral_flatness(S=S)[0]
+    # Rhythmic drive: spectral flux on a fixed linear mel-magnitude scale (energy of new sound events).
+    # Version 1 used onset strength on dB normalised to each mix's own peak with an 80 dB floor, so
+    # removing a loud stem lowered the floor and quiet detail counted as onsets: removing the drums
+    # *raised* 'rhythm' by 9% in one song and changed it by -1% in a metal track.
+    mel = np.sqrt(librosa.feature.melspectrogram(S=S ** 2, sr=SR, n_mels=128))
+    flux = np.maximum(np.diff(mel, axis=1), 0).sum(axis=0)
+    return {
+        'rms_mean': float(rms.mean()),
+        'onset_mean': float(flux.mean()),
+        'centroid_weighted': float((centroid * w).sum() / wsum),
+        'flatness_weighted': float((flatness * w).sum() / wsum),
+    }
+
+done = skipped = failed = 0
+t_start = time.time()
+for i, tid in enumerate(ids):
+    out = out_dir / f'{tid}.json'
+    if out.exists():
+        skipped += 1
+        continue
+    song_dir = Path(manifest[tid]['file_path']).parent
+    paths = {}
+    for s in STEMS:
+        p = next((song_dir / f'{s}{ext}' for ext in ('.wav', '.flac') if (song_dir / f'{s}{ext}').exists()), None)
+        if p is not None:
+            paths[s] = p
+    if len(paths) != 4:
+        continue
+    try:
+        t0 = time.time()
+        stems = {s: load_stem(p) for s, p in paths.items()}
+        n = max(len(y) for y in stems.values())
+        stems = {s: np.pad(y, (0, n - len(y))) for s, y in stems.items()}
+        full = sum(stems.values())
+        result = {'full': measure(full)}
+        for s in STEMS:
+            result[f'minus_{s}'] = measure(full - stems[s])
+        result['stem_rms'] = {s: float(np.sqrt(np.mean(stems[s] ** 2))) for s in STEMS}
+        result['measures_version'] = 2  # onset_mean = linear mel spectral flux
+        tmp = out.with_suffix('.json.part')
+        tmp.write_text(json.dumps(result))
+        tmp.replace(out)
+        done += 1
+        if done % 10 == 0:
+            print(f'  {done} done ({i+1}/{len(ids)}), last {time.time()-t0:.0f}s', flush=True)
+    except Exception as e:
+        failed += 1
+        print(f'  FAILED {tid}: {type(e).__name__}: {e}', flush=True)
+
+print(f'Complete: {done} measured, {skipped} skipped, {failed} failed in {time.time()-t_start:.0f}s', flush=True)
+sys.exit(1 if failed else 0)
+"
+PY_STATUS=$?
+
+echo "=== Ablation files ==="
+ls ${DATA_ROOT}/features/ablation/*.json 2>/dev/null | wc -l
+echo "Finished: $(date)"
+exit ${PY_STATUS}

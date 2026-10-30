@@ -1,0 +1,163 @@
+#!/bin/bash
+#PBS -N mw_benchmark
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — generates benchmark questions from annotations and features.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+
+echo "=== Phase 4: Benchmark Construction ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+
+# Import from a node-local copy of the code (see mw_stage_bundle in _env.sh)
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+
+${PYTHON} -S -c "
+import sys, json
+sys.path.insert(0, '.')
+from pathlib import Path
+from musicwhy.data.light_io import load_manifest, load_features
+from musicwhy.benchmark.question_generator import QuestionGenerator
+from musicwhy.benchmark.export import BenchmarkExporter
+print('imports done', flush=True)
+
+data_root = Path('${DATA_ROOT}')
+manifest = load_manifest(data_root)
+feat_dir = data_root / 'features'
+ann_dir = data_root / 'annotations'
+out_dir = data_root / 'benchmark'
+out_dir.mkdir(parents=True, exist_ok=True)
+
+STEM_NAMES = ['bass', 'drums', 'vocals', 'other']
+stem_feat_dir = feat_dir / 'stems'
+
+def load_stem_features(tid, stem_name):
+    path = stem_feat_dir / f'{tid}_{stem_name}.json'
+    if not path.exists():
+        return None
+    with open(path) as fh:
+        return json.load(fh)
+
+# Load all tracks with both features and annotations
+songs = []
+songs_with_stems = []
+# Sorted: set order changes with per-process hash randomisation, which made the seeded benchmark irreproducible
+for tid in sorted(manifest):
+    rec = manifest[tid]
+    feat_file = feat_dir / f'{tid}.h5'
+    ann_file = ann_dir / f'{tid}.json'
+
+    if not feat_file.exists() or feat_file.stat().st_size < 500:
+        continue
+
+    try:
+        features = load_features(tid, feat_dir)
+    except Exception as e:
+        print(f'  Skip {tid}: corrupt h5 ({e})', flush=True)
+        continue
+
+    annotation = {}
+    if ann_file.exists():
+        with open(ann_file) as f:
+            annotation = json.load(f)
+
+    song = {
+        'track_id': tid,
+        'song_id': tid,
+        'title': rec['title'],
+        'artist': rec['artist'],
+        'genre': rec['genre'],
+        'year': rec['year'],
+        'audio_path': rec['file_path'],
+        'features': features,
+        'annotation': annotation,
+    }
+    songs.append(song)
+
+    stem_feats = {}
+    for sn in STEM_NAMES:
+        sf = load_stem_features(tid, sn)
+        if sf is not None:
+            stem_feats[sn] = sf
+
+    ablation_file = feat_dir / 'ablation' / f'{tid}.json'
+    if len(stem_feats) == 4 and ablation_file.exists():
+        song_with_stems = dict(song)
+        song_with_stems['stem_features'] = stem_feats
+        song_with_stems['ablation'] = json.loads(ablation_file.read_text())
+        songs_with_stems.append(song_with_stems)
+
+print(f'Loaded {len(songs)} tracks with features')
+print(f'  {len(songs_with_stems)} tracks also have 4 stem features and ablation measurements')
+by_id = {s['song_id']: s for s in songs}
+
+# Generate questions
+gen = QuestionGenerator(seed=42)
+all_questions = []
+
+# Task 1: Reasoning QA — with contextual distractors
+t1 = gen.generate_task_1_questions(songs, n_questions=min(500, len(songs) * 2))
+all_questions.extend(t1)
+print(f'Task 1 (Reasoning QA): {len(t1)} questions')
+
+# Task 2: Source-Aware Emotion Attribution (NEW — uses stem features)
+if songs_with_stems:
+    t2 = gen.generate_task_2_questions(songs_with_stems, n_questions=min(200, len(songs_with_stems) * 2))
+    all_questions.extend(t2)
+    print(f'Task 2 (Source Attribution): {len(t2)} questions')
+else:
+    print('Task 2: skipped (no tracks with stem features)')
+
+# Task 3: Song Relationship (pairs from phase6/extract_embeddings.pbs)
+pairs_path = data_root / 'embeddings' / 'similar_pairs.json'
+if pairs_path.exists():
+    with open(pairs_path) as fh:
+        pairs = json.load(fh)
+    # Pair files store per-frame features as means; use the full features (and genre) instead
+    def enrich(s):
+        full = by_id.get(s.get('song_id'))
+        return dict(s, features=full['features'], genre=full['genre']) if full else s
+    pairs = [dict(p, song_a=enrich(p['song_a']), song_b=enrich(p['song_b']),
+                  distractors=[enrich(d) for d in p.get('distractors', [])])
+             for p in pairs if p['song_a']['song_id'] in by_id and p['song_b']['song_id'] in by_id]
+    t3 = gen.generate_task_3_questions(pairs, n_questions=min(200, len(pairs)))
+    all_questions.extend(t3)
+    print(f'Task 3 (Song Relationship): {len(t3)} questions')
+else:
+    print('Task 3: skipped (no similar_pairs.json; run phase6/extract_embeddings.pbs first)')
+
+# Task 4: Symbolic Sound (no audio needed)
+t4 = gen.generate_task_4_questions(n_questions=200)
+all_questions.extend(t4)
+print(f'Task 4 (Symbolic Sound): {len(t4)} questions')
+
+# Task 5: Sound-World (no audio needed)
+t5 = gen.generate_task_5_questions(n_questions=200)
+all_questions.extend(t5)
+print(f'Task 5 (Sound-World): {len(t5)} questions')
+
+for q in all_questions:
+    q.setdefault('modality', 'text')  # Tasks 4-5 are text-only descriptions
+print(f'Total: {len(all_questions)} questions')
+
+# Export
+exporter = BenchmarkExporter()
+exporter.to_json(all_questions, str(out_dir / 'musicwhy_benchmark.json'))
+print(f'Exported to {out_dir / \"musicwhy_benchmark.json\"}')
+
+# Create splits
+splits = exporter.create_splits(all_questions, val_ratio=0.1, test_ratio=0.9, seed=42)
+for split_name, split_qs in splits.items():
+    exporter.to_json(split_qs, str(out_dir / f'musicwhy_{split_name}.json'))
+    print(f'  {split_name}: {len(split_qs)} questions')
+"
+PY_STATUS=$?
+
+echo "=== Benchmark files ==="
+ls -lh ${DATA_ROOT}/benchmark/ 2>/dev/null
+echo "Finished: $(date)"
+exit ${PY_STATUS}

@@ -1,0 +1,85 @@
+#!/bin/bash
+#PBS -N mw_demucs_q
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — how close are Demucs stems (data/stems/<tid>/) to the real multitrack stems?
+# For every manifest track that has both, computes per-stem SDR = 10*log10(|s|^2 / |s - s_hat|^2)
+# over the whole song (plain SDR, not the BSS-eval variant; higher is better, ~6-9 dB is typical
+# for htdemucs on MUSDB). This is the quality reference for using Demucs on sources without stems.
+# Output: data/results/demucs_vs_truth.json
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+
+echo "=== Phase 2B: Demucs vs ground-truth stems ==="
+echo "Started: $(date)"
+
+${PYTHON} -S -c "
+import sys, json
+sys.path.insert(0, '.')
+from pathlib import Path
+import numpy as np
+import soundfile as sf
+from musicwhy.data.light_io import load_manifest
+
+data_root = Path('${DATA_ROOT}')
+manifest = load_manifest(data_root)
+STEMS = ['bass', 'drums', 'vocals', 'other']
+
+def find(d, stem):
+    return next((d / f'{stem}{e}' for e in ('.flac', '.wav') if (d / f'{stem}{e}').exists()), None)
+
+per_track, by_stem = {}, {s: [] for s in STEMS}
+for tid, rec in sorted(manifest.items()):
+    demucs_dir = data_root / 'stems' / tid
+    true_dir = Path(rec['file_path']).parent
+    if not demucs_dir.is_dir():
+        continue
+    row = {}
+    for s in STEMS:
+        est_p, ref_p = find(demucs_dir, s), find(true_dir, s)
+        if est_p is None or ref_p is None:
+            continue
+        ref, sr1 = sf.read(str(ref_p), dtype='float32', always_2d=True)
+        est, sr2 = sf.read(str(est_p), dtype='float32', always_2d=True)
+        if sr1 != sr2:
+            continue
+        n = min(len(ref), len(est))
+        ref, est = ref[:n, :2], est[:n, :2]
+        num = float((ref ** 2).sum())
+        den = float(((ref - est) ** 2).sum())
+        if num < 1e-6:
+            continue  # silent reference stem: SDR undefined
+        sdr = 10 * np.log10(num / max(den, 1e-12))
+        row[s] = round(sdr, 2)
+        by_stem[s].append(sdr)
+    if row:
+        per_track[tid] = row
+
+def summarise(ids):
+    out = {}
+    for s in STEMS:
+        v = [per_track[t][s] for t in ids if s in per_track[t]]
+        out[s] = {'n': len(v), 'median_sdr_db': round(float(np.median(v)), 2) if v else None,
+                  'mean_sdr_db': round(float(np.mean(v)), 2) if v else None}
+    return out
+
+# htdemucs was trained on MUSDB18's train split, so only test-split tracks give a fair score
+test_ids = [t for t in per_track if '/test/' in manifest[t]['file_path']]
+summary = summarise(test_ids)
+out = data_root / 'results' / 'demucs_vs_truth.json'
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(json.dumps({'summary_test_split': summary, 'summary_all_incl_training_tracks': summarise(list(per_track)),
+                           'per_track': per_track}, indent=2))
+print(f'Fair (MUSDB test split, unseen by htdemucs): {len(test_ids)} tracks', flush=True)
+print(f'{len(per_track)} tracks compared', flush=True)
+for s, v in summary.items():
+    print(f'  {s}: {v}', flush=True)
+sys.exit(0 if per_track else 1)
+"
+PY_STATUS=$?
+echo "Finished: $(date)"
+exit ${PY_STATUS}

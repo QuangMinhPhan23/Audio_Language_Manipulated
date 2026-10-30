@@ -1,0 +1,77 @@
+#!/bin/bash
+#PBS -N mw_moisesdb
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — converts MoisesDB (240 multitracks, genre-labelled) to data/raw/moisesdb/tracks/<uuid>/
+# as mixture/vocals/bass/drums/other .flac plus meta.json (see musicwhy/data/moisesdb_convert.py).
+#
+# The audio is not on GitHub: request it at https://music.ai/research/ and put the emailed link in
+# ~/.musicwhy_secrets as MOISESDB_URL='...'. The ~83 GB zip is read in place over HTTP Range requests,
+# because scratch can't hold it. Alternatively set MOISESDB_ZIP to a zip already on disk.
+#
+# Resumable: tracks with meta.json are skipped. Each shard stops after ~100 min and submits the next
+# one itself (no -W depend), until every track is converted or MAX_SHARDS is reached.
+# Parallel: submit N chains with -v PART=i,N_PARTS=N; part i converts every N-th track.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+# Import from a node-local copy of the code: cold compute nodes block for minutes on each first
+# file open on scratch (see mw_stage_bundle in _env.sh)
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+
+SHARD=${SHARD:-0}
+MAX_SHARDS=${MAX_SHARDS:-8}
+PART=${PART:-0}
+N_PARTS=${N_PARTS:-1}
+OUT=${DATA_ROOT}/raw/moisesdb/tracks
+DONE_MARKER=${OUT}/.convert_done_${PART}of${N_PARTS}
+
+echo "=== Phase 1A: MoisesDB conversion (part ${PART}/${N_PARTS}, shard ${SHARD}/${MAX_SHARDS}) ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+
+if [ -f "${DONE_MARKER}" ]; then
+    echo "MoisesDB already converted: $(cat ${DONE_MARKER})"
+    exit 0
+fi
+if [ -z "${MOISESDB_URL}" ] && [ -z "${MOISESDB_ZIP}" ]; then
+    echo "ERROR: set MOISESDB_URL in ~/.musicwhy_secrets (link from https://music.ai/research/) or MOISESDB_ZIP."
+    exit 1
+fi
+mkdir -p ${OUT}
+
+${PYTHON} -S -c "
+import os, sys, time, zipfile
+sys.path.insert(0, '.')
+from pathlib import Path
+from musicwhy.data.moisesdb_convert import convert_all
+
+src = os.environ.get('MOISESDB_ZIP') or os.environ['MOISESDB_URL']
+if os.environ.get('MOISESDB_ZIP'):
+    zf = zipfile.ZipFile(src)
+else:
+    from musicwhy.data.remote_zip import open_remote_zip
+    zf = open_remote_zip(src)
+converted, already, failed, remaining = convert_all(zf, Path('${OUT}'), deadline=time.time() + 100 * 60,
+                                                    part=${PART}, n_parts=${N_PARTS})
+done = sum(1 for p in Path('${OUT}').glob('*/meta.json'))
+print(f'Shard summary: {converted} converted, {already} already done, {failed} failed, {remaining} not reached; {done} tracks on disk', flush=True)
+if remaining == 0:
+    # Reached the end of the zip; failures are recorded rather than retried by more shards
+    Path('${DONE_MARKER}').write_text(f'{done} tracks, {failed} failed in final pass\n')
+    print(f'Reached the end of part ${PART}/${N_PARTS}: {done} tracks converted, {failed} failed.', flush=True)
+"
+RC=$?
+
+NEXT_SHARD=$((SHARD + 1))
+if [ ${RC} -eq 0 ] && [ ! -f "${DONE_MARKER}" ] && [ -n "${SHARD}" ] && [ "${NEXT_SHARD}" -lt "${MAX_SHARDS}" ]; then
+    NEXT_ID=$(qsub -l walltime=02:00:00 -l select=1:ncpus=4:mem=16gb \
+        -v SHARD=${NEXT_SHARD},MAX_SHARDS=${MAX_SHARDS},PART=${PART},N_PARTS=${N_PARTS} \
+        ${REPO}/jobs/phase1/collect_moisesdb.pbs)
+    echo "Submitted shard ${NEXT_SHARD}: ${NEXT_ID}"
+fi
+
+du -sh ${OUT} 2>/dev/null
+echo "Finished: $(date)"

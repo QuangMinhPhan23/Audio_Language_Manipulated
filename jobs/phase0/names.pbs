@@ -1,0 +1,20 @@
+#!/bin/bash
+#PBS -N mw_p0_names
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — Phase 0 §2 (scripts/phase0_names.py). STEP is generate (claude-haiku-5-5, 40 calls), filter
+# (infini-gram counts + MGPHot title overlap), assign (songs.jsonl) or recheck (Test 2.1, on a later day).
+# API- and network-bound, so cput stays near zero; judge progress by data/phase0/names/. Reruns resume.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+
+echo "=== Phase 0 names: ${STEP:?set STEP} ==="
+echo "Started: $(date)  Node: $(hostname)"
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+export MODEL=${MODEL:-claude-haiku-5-5}
+${PYTHON} -S ${CODE_ROOT}/scripts/phase0_names.py ${STEP} || exit 1
+echo "Finished: $(date)"

@@ -1,0 +1,145 @@
+#!/bin/bash
+#PBS -N mw_manifest
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — one manifest row per song folder under data/raw/<source>/.
+# Metadata precedence: the folder's meta.json (MoisesDB converter) > sigsep's MUSDB tracklist.csv
+# (genre, license) > the previous manifest (years from lookup_metadata) > unknown.
+# track_id is a hash of the main file's path, so ids of existing songs never change.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+# Import from a node-local copy of the code: cold compute nodes block for minutes on each first
+# file open on scratch (see mw_stage_bundle in _env.sh)
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+
+echo "=== Phase 1: Build Track Manifest (song-level dedup) ==="
+echo "Started: $(date)"
+
+${PYTHON} -S -c "
+import csv, sys, hashlib, shutil
+sys.path.insert(0, '.')
+from collections import Counter
+from pathlib import Path
+import soundfile as sf
+from musicwhy.data.manifest import TrackManifest, TrackRecord
+from musicwhy.data.source_meta import load_musdb_tracklist, lookup_musdb, read_song_meta, normalize_genre
+
+data_root = Path('${DATA_ROOT}/raw')
+manifest_path = Path('${DATA_ROOT}') / 'manifest.csv'
+
+old = {}
+if manifest_path.exists():
+    shutil.copy2(manifest_path, manifest_path.with_suffix('.csv.bak'))
+    print(f'Backed up old manifest to {manifest_path.with_suffix(\".csv.bak\")}')
+    with open(manifest_path, newline='', encoding='utf-8') as f:
+        old = {r['track_id']: r for r in csv.DictReader(f)}
+
+tracklist_path = data_root / 'musdb18hq' / 'tracklist.csv'
+musdb_meta = load_musdb_tracklist(tracklist_path) if (data_root / 'musdb18hq').is_dir() else {}
+print(f'MUSDB tracklist: {len(musdb_meta)} entries')
+
+manifest = TrackManifest(manifest_path)
+STEM_NAMES = {'bass', 'drums', 'vocals', 'other'}
+audio_exts = {'.wav', '.mp3', '.flac', '.ogg', '.aiff'}
+seen = set()
+audio_seen = {}
+duplicates = []
+skipped_stems = 0
+meta_from = Counter()
+
+for source_dir in sorted(data_root.iterdir()):
+    if not source_dir.is_dir():
+        continue
+    source_name = source_dir.name
+    print(f'Scanning {source_name}...')
+
+    # Group audio files by parent directory (= song)
+    song_dirs = {}
+    for audio_file in sorted(source_dir.rglob('*')):
+        if audio_file.suffix.lower() not in audio_exts or audio_file.stat().st_size < 1000:
+            continue
+        song_dirs.setdefault(audio_file.parent, []).append(audio_file)
+
+    for song_path, files in sorted(song_dirs.items()):
+        by_stem = {f.stem.lower(): f for f in files}
+        main_file = by_stem.get('mixture') or next((f for f in files if f.stem.lower() not in STEM_NAMES), None)
+        if main_file is None:
+            skipped_stems += len(files)
+            continue
+
+        # Exact duplicate audio under another name (MoisesDB ships Firefly 'The Long Way' and
+        # 'Up Close And Personal' as the same recording): keep the first, so it can't leak across splits
+        with open(main_file, 'rb') as fh:
+            audio_key = (main_file.stat().st_size, hashlib.sha1(fh.read(4 << 20)).hexdigest())
+        if audio_key in audio_seen:
+            duplicates.append(f'{song_path.name} == {audio_seen[audio_key]}')
+            continue
+        audio_seen[audio_key] = song_path.name
+
+        track_id = hashlib.sha256(str(main_file.relative_to(data_root)).encode()).hexdigest()[:16]
+        prev = old.get(track_id, {})
+        song_meta = read_song_meta(song_path) or {}
+        list_meta = lookup_musdb(musdb_meta, song_path.name) if source_name == 'musdb18hq' else {}
+
+        folder = song_path.name
+        artist, title = (p.strip() for p in folder.split(' - ', 1)) if ' - ' in folder else ('unknown', folder)
+        artist = song_meta.get('artist') or artist
+        title = song_meta.get('title') or title
+
+        genre = normalize_genre(song_meta.get('genre') or list_meta.get('genre') or prev.get('genre') or '')
+        meta_from['genre:' + ('meta.json' if song_meta.get('genre') else 'tracklist' if list_meta.get('genre')
+                              else 'previous' if genre != 'unknown' else 'none')] += 1
+        try:
+            prev_year = int(float(prev.get('year') or 0))
+        except ValueError:
+            prev_year = 0
+        year = int(song_meta.get('year') or 0) or prev_year
+        license_ = song_meta.get('license') or list_meta.get('license') or prev.get('license') or 'unknown'
+        if license_ == 'CC':  # placeholder the old builder wrote for every track
+            license_ = 'unknown'
+
+        try:
+            dur = sf.info(str(main_file)).duration
+        except Exception:
+            dur = 0.0
+
+        manifest.add_track(TrackRecord(
+            track_id=track_id,
+            source=source_name,
+            file_path=str(main_file),
+            title=title,
+            artist=artist,
+            genre=genre,
+            year=year,
+            duration=dur,
+            license=license_,
+            has_stems=any(s in by_stem for s in STEM_NAMES),
+            has_features=str(prev.get('has_features', '')).lower() == 'true',
+            has_annotations=str(prev.get('has_annotations', '')).lower() == 'true',
+        ))
+        seen.add(track_id)
+
+# Drop rows whose audio is gone, so the manifest only lists songs on disk
+stale = manifest.track_ids() - seen
+for tid in stale:
+    manifest.remove_track(tid)
+
+unmatched = sorted(d.name for d in (data_root / 'musdb18hq').glob('*/*') if d.is_dir() and not lookup_musdb(musdb_meta, d.name))
+manifest.save()
+print(f'Manifest built: {len(seen)} songs (removed {len(stale)} stale rows, skipped {skipped_stems} orphan stem files)')
+print(f'Genre sources: {dict(meta_from)}')
+print(f'Exact duplicate audio skipped: {len(duplicates)} {duplicates}')
+print(f'MUSDB folders missing from tracklist: {len(unmatched)} {unmatched[:5]}')
+for k, v in manifest.stats().items():
+    print(f'  {k}: {v}')
+"
+PY_STATUS=$?
+
+echo "=== Manifest ==="
+head -5 ${DATA_ROOT}/manifest.csv 2>/dev/null
+wc -l ${DATA_ROOT}/manifest.csv 2>/dev/null
+echo "Finished: $(date)"
+exit ${PY_STATUS}

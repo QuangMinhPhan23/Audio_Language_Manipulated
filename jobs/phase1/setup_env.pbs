@@ -1,0 +1,52 @@
+#!/bin/bash
+#PBS -N mw_p1_setup
+#PBS -l select=1:ncpus=8:mem=48gb:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# GPU job — sets up the Phase 1 training environment and downloads model weights.
+# Run once before train.pbs.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+
+echo "=== Phase 1: Environment Setup ==="
+echo "Started: $(date)  Node: $(hostname)"
+echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
+
+VENV=/srv/scratch/z5531827/venvs/phase1_train
+
+echo "Recreating venv..."
+rm -rf "${VENV}"
+python3 -m venv "${VENV}"
+
+source "${VENV}/bin/activate"
+
+echo "Installing packages..."
+pip install --upgrade pip
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install transformers accelerate peft bitsandbytes datasets
+pip install librosa soundfile
+
+echo "Downloading Qwen2-Audio-7B-Instruct weights..."
+python -c "
+from transformers import Qwen2AudioForConditionalGeneration, AutoProcessor
+model_id = 'Qwen/Qwen2-Audio-7B-Instruct'
+print('Downloading processor...', flush=True)
+AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+print('Downloading model weights (this takes a while)...', flush=True)
+Qwen2AudioForConditionalGeneration.from_pretrained(model_id, trust_remote_code=True, torch_dtype='auto')
+print('Done.', flush=True)
+"
+
+echo "Downloading Alpaca replay data..."
+cd ${DATA_ROOT}/injection
+if [ ! -f alpaca_data_cleaned.json ]; then
+    wget -q https://raw.githubusercontent.com/gururise/AlpacaDataCleaned/main/alpaca_data_cleaned.json
+    echo "Downloaded alpaca_data_cleaned.json"
+else
+    echo "alpaca_data_cleaned.json already exists"
+fi
+
+echo "Finished: $(date)"

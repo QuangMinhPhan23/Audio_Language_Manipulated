@@ -1,0 +1,387 @@
+#!/bin/bash
+#PBS -N mw_eval
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — evaluates Claude (text-based) on the benchmark via API.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+
+echo "=== Phase 5: Model Evaluation (claude-text) ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+
+# Import from a node-local copy of the code (see mw_stage_bundle in _env.sh)
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+
+${PYTHON} -S -c "
+import sys, json, time
+sys.path.insert(0, '.')
+from pathlib import Path
+
+data_root = Path('${DATA_ROOT}')
+results_dir = data_root / 'results'
+results_dir.mkdir(parents=True, exist_ok=True)
+
+# BENCH picks another question file (e.g. musicwhy_era_test.json); TAG keeps its results apart
+benchmark_file = data_root / 'benchmark' / '${BENCH:-musicwhy_test.json}'
+TAG = '${TAG:-}'
+if not benchmark_file.exists():
+    print('ERROR: Benchmark not found. Run Phase 4 first.')
+    sys.exit(1)
+
+with open(benchmark_file) as f:
+    benchmark_data = json.load(f)
+    questions = benchmark_data if isinstance(benchmark_data, list) else benchmark_data.get('questions', [])
+
+print(f'Loaded {len(questions)} test questions')
+
+from musicwhy.evaluation.models import ClaudeTextWrapper
+from musicwhy.evaluation.metrics import mc_accuracy
+
+model = ClaudeTextWrapper(model_name='claude-haiku-5-5')
+print(f'Evaluating model: claude-haiku-5-5')
+
+JUDGE_MODEL = 'claude-sonnet-5-5'  # a different model from the one answering, so it doesn't grade itself
+
+def text_input(q):
+    # Text-only model: the measured summary if the question has one, never the audio path(s).
+    # Audio-modality questions get nothing: their metadata still holds the text version's
+    # measurements, which made an earlier 'blind' run read the numbers it was meant to lack.
+    if q.get('modality', 'text') != 'text':
+        # Blind runs must force a guess: told nothing, the model refused ('I can't hear audio') on
+        # 31 of 50 questions, and the old answer parser turned those refusals into letters.
+        return BLIND_NOTE if BLIND else ''
+    s = q.get('metadata', {}).get('features_summary', '')
+    return s if isinstance(s, str) else ''
+
+# Text model answers only text-modality questions; audio-modality ones need listening.
+# BLIND=1 instead answers the audio-modality questions WITHOUT audio: how far above chance a model
+# gets there is how much of an audio question can be solved from its wording alone (a leak check).
+BLIND = '${BLIND:-0}' == '1'
+BLIND_NOTE = ('No audio is available for this question. Still choose the option that seems most likely '
+              'from the wording alone; you must answer with one letter.')
+want = 'audio' if BLIND else 'text'
+mc_questions = [q for q in questions if q.get('options') and q.get('modality', 'text') == want
+                and not (BLIND and isinstance(q.get('audio_reference'), dict))]
+print(f'MC questions to evaluate: {len(mc_questions)} ({want} modality{\", no audio given\" if BLIND else \"\"})')
+
+predictions = []
+ground_truth = []
+question_ids = []
+raw_responses = []
+
+# Resume from existing partial results
+out_file = results_dir / (f'eval_claude_blind{TAG}.json' if BLIND else f'eval_claude_text{TAG}.json')
+start_idx = 0
+if out_file.exists():
+    try:
+        with open(out_file) as f:
+            partial = json.load(f)
+        predictions = partial.get('predictions', [])
+        ground_truth = partial.get('ground_truth', [])
+        question_ids = partial.get('question_ids', [])
+        raw_responses = partial.get('raw_responses', [''] * len(predictions))
+        start_idx = len(predictions)
+        if question_ids != [q['question_id'] for q in mc_questions[:start_idx]]:
+            sys.exit(f'{out_file} was made from a different question list; move it aside before rerunning')
+        if start_idx > 0:
+            print(f'Resuming from question {start_idx}')
+    except Exception:
+        pass
+
+# API-bound: run WORKERS calls at once, keep results in question order, checkpoint every batch
+from concurrent.futures import ThreadPoolExecutor
+WORKERS = 8
+model._ensure_loaded()  # create the client once, before threads share it
+
+from musicwhy.evaluation.models import last_mc_response
+
+import random as _random
+
+def answer_one(q):
+    # Several API jobs at once exceeded the account's concurrent-request limit (HTTP 429): wait and retry
+    for attempt in range(6):
+        try:
+            pred = model.answer_mc(text_input(q), q['question_text'], q['options'])
+            return pred, last_mc_response()
+        except Exception as e:
+            busy = '429' in str(e) or type(e).__name__ in ('RateLimitError', 'OverloadedError', 'InternalServerError')
+            if busy and attempt < 5:
+                time.sleep(min(60, 5 * 2 ** attempt) + _random.random())
+                continue
+            print('  Error on', q['question_id'], type(e).__name__, e, flush=True)
+            return 'X', f'ERROR {type(e).__name__}: {e}'
+
+# LIMIT=N stops after the first N questions (a small batch to check before the full run, which resumes)
+LIMIT = int('${LIMIT:-0}')
+todo = mc_questions[start_idx:LIMIT or None]
+with ThreadPoolExecutor(WORKERS) as pool:
+    # Re-answer questions that failed with an API error in an earlier run
+    by_id = {q['question_id']: q for q in mc_questions}
+    retry = [i for i, raw in enumerate(raw_responses) if raw.startswith('ERROR')]
+    if retry:
+        print(f'Retrying {len(retry)} questions that failed with API errors', flush=True)
+        for i, (pred, raw) in zip(retry, pool.map(answer_one, [by_id[question_ids[i]] for i in retry])):
+            predictions[i], raw_responses[i] = pred, raw
+    for b in range(0, len(todo), 25):
+        batch = todo[b:b + 25]
+        for q, (pred, raw) in zip(batch, pool.map(answer_one, batch)):
+            predictions.append(pred)
+            raw_responses.append(raw)
+            ground_truth.append(q['correct_answer'])
+            question_ids.append(q['question_id'])
+        acc_so_far = mc_accuracy(predictions, ground_truth)
+        print(f'  {len(predictions)}/{len(mc_questions)} done, accuracy so far: {acc_so_far:.3f}', flush=True)
+        results = {
+            'model': 'claude-haiku-5-5',
+            'mc_accuracy': acc_so_far,
+            'n_questions': len(predictions),
+            'predictions': predictions,
+            'ground_truth': ground_truth,
+            'question_ids': question_ids,
+            'raw_responses': raw_responses,
+        }
+        with open(out_file, 'w') as f:
+            json.dump(results, f, indent=2)
+
+acc = mc_accuracy(predictions, ground_truth)
+print(f'Final MC accuracy for claude-haiku-5-5: {acc:.4f} ({len(predictions)} questions)')
+
+results = {
+    'model': 'claude-haiku-5-5',
+    'mc_accuracy': acc,
+    'n_questions': len(predictions),
+    'predictions': predictions,
+    'ground_truth': ground_truth,
+    'question_ids': question_ids,
+    'raw_responses': raw_responses,
+}
+with open(out_file, 'w') as f:
+    json.dump(results, f, indent=2)
+print(f'Results saved to {out_file}')
+
+# ---------------------------------------------------------------
+# Task 5: Open-ended rubric-based evaluation
+# ---------------------------------------------------------------
+import re
+
+open_questions = [] if BLIND or LIMIT else [q for q in questions
+                                            if not q.get('options') and q.get('modality', 'text') == 'text']
+print(f'\\nOpen-ended questions to evaluate: {len(open_questions)}')
+
+if open_questions:
+    open_out_file = results_dir / f'eval_claude_text_open{TAG}.json'
+    open_results = []
+    open_start_idx = 0
+
+    # Resume from checkpoint
+    if open_out_file.exists():
+        try:
+            with open(open_out_file) as f:
+                partial_open = json.load(f)
+            open_results = partial_open.get('per_question', [])
+            open_start_idx = len(open_results)
+            if open_start_idx > 0:
+                print(f'Resuming open-ended eval from question {open_start_idx}')
+        except Exception:
+            pass
+
+    # Use the same Anthropic client as model._client
+    model._ensure_loaded()
+    client = model._client
+
+    def parse_grading_json(text):
+        \"\"\"Extract JSON object with scores from grading response.\"\"\"
+        # Try to find JSON block in the response
+        patterns = [
+            r'\{[^{}]*\"factual_accuracy\"[^{}]*\}',
+            r'\{[^{}]*\"depth_of_reasoning\"[^{}]*\}',
+            r'\{[^{}]*\d+[^{}]*\}',
+        ]
+        for pat in patterns:
+            m = re.search(pat, text, re.DOTALL)
+            if m:
+                try:
+                    obj = json.loads(m.group())
+                    return obj
+                except json.JSONDecodeError:
+                    continue
+        # Fallback: try parsing the whole response
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        # Unparseable grades become errors rather than silent 1s, so they show up in validation
+        return None
+
+    def eval_open(i, q):
+        question_text = q['question_text']
+        ref_explanation = q.get('reference_explanation', q.get('explanation', ''))
+
+        try:
+            # Step 1: Generate the model answer
+            model_answer = model.answer_open(text_input(q), question_text)
+            answer_stop_reason = model.last_stop_reason
+
+            # Step 2: Grade with a separate Claude call
+            grading_prompt = (
+                'You are an expert evaluator for music understanding. '
+                'Grade the following answer on three dimensions, each scored 1 to 5.\\n\\n'
+                'Dimensions:\\n'
+                '1. Factual accuracy: Are the answer\\'s claims consistent with the measurements in the question and the reference explanation? Penalise claims that contradict them. (1=incorrect, 5=perfectly accurate)\\n'
+                '2. Depth of reasoning: Is the reasoning superficial or multi-layered? (1=superficial, 5=deep multi-layered reasoning)\\n'
+                '3. Specificity: Does the answer use concrete audio features or make vague claims? (1=vague, 5=highly specific with concrete features)\\n\\n'
+                f'Question: {question_text}\\n\\n'
+                f'Model answer: {model_answer}\\n\\n'
+                f'Reference explanation: {ref_explanation}\\n\\n'
+                'Respond with ONLY a JSON object like: '
+                '{\"factual_accuracy\": <1-5>, \"depth_of_reasoning\": <1-5>, \"specificity\": <1-5>}'
+            )
+
+            # Thinking shares max_tokens: 300 truncated the JSON mid-key
+            grading_response = client.messages.create(
+                model=JUDGE_MODEL,
+                max_tokens=4000,
+                messages=[{'role': 'user', 'content': grading_prompt}],
+            )
+            if grading_response.stop_reason == 'max_tokens':
+                raise ValueError('grader hit max_tokens')
+            grading_text = '\\n'.join(b.text for b in grading_response.content if b.type == 'text')
+            scores = parse_grading_json(grading_text)
+            keys = ('factual_accuracy', 'depth_of_reasoning', 'specificity')
+            if not scores or not all(isinstance(scores.get(k), (int, float)) for k in keys):
+                raise ValueError(f'unparseable grade: {grading_text[:120]!r}')
+            scores = {k: scores[k] for k in keys}
+
+            # Era 'why' questions carry a checklist of sourced reasons: count which ones the answer makes
+            coverage = None
+            checklist = (q.get('metadata') or {}).get('checklist')
+            if checklist:
+                reasons = [c['reason'] for c in checklist]
+                wrong = [c['claim'] for c in (q['metadata'].get('reject') or [])]
+                cov_prompt = (
+                    'Below is an answer to a question about why popular music changed, then numbered accepted '
+                    'reasons and numbered known-wrong claims. List which accepted reasons the answer clearly makes '
+                    '(in any wording) and which known-wrong claims it asserts.\\n\\n'
+                    f'Question: {question_text}\\n\\nAnswer: {model_answer}\\n\\nAccepted reasons:\\n'
+                    + '\\n'.join(f'{n + 1}. {r}' for n, r in enumerate(reasons))
+                    + '\\n\\nKnown-wrong claims:\\n' + ('\\n'.join(f'{n + 1}. {r}' for n, r in enumerate(wrong)) or 'none')
+                    + '\\n\\nRespond with ONLY a JSON object like {\"covered\": [1, 3], \"wrong_claims\": []}'
+                )
+                cov_response = client.messages.create(model=JUDGE_MODEL, max_tokens=4000,
+                                                      messages=[{'role': 'user', 'content': cov_prompt}])
+                if cov_response.stop_reason == 'max_tokens':
+                    raise ValueError('coverage grader hit max_tokens')
+                cov_text = '\\n'.join(b.text for b in cov_response.content if b.type == 'text')
+                m = re.search(r'\{.*\}', cov_text, re.DOTALL)
+                cov = json.loads(m.group()) if m else None
+                if not isinstance(cov, dict) or not isinstance(cov.get('covered'), list):
+                    raise ValueError(f'unparseable coverage: {cov_text[:120]!r}')
+                covered = sorted({int(x) for x in cov['covered'] if 1 <= int(x) <= len(reasons)})
+                wrong_made = sorted({int(x) for x in cov.get('wrong_claims') or [] if 1 <= int(x) <= len(wrong)})
+                coverage = {'covered': covered, 'n_reasons': len(reasons), 'fraction': len(covered) / len(reasons),
+                            'wrong_claims': wrong_made, 'judge_stop_reason': cov_response.stop_reason}
+
+            return {
+                'question_idx': i,
+                'question_id': q['question_id'],
+                'task_id': q.get('task_id'),
+                'judge_model': JUDGE_MODEL,
+                'question_text': question_text,
+                'model_answer': model_answer,
+                'stop_reason': answer_stop_reason,
+                'judge_stop_reason': grading_response.stop_reason,
+                'scores': scores,
+                'checklist_coverage': coverage,
+            }
+
+        except Exception as e:
+            print(f'  Error on open q{i}: {e}', flush=True)
+            return {
+                'question_idx': i,
+                'question_id': q['question_id'],
+                'task_id': q.get('task_id'),
+                'question_text': question_text,
+                'model_answer': '',
+                'scores': {'factual_accuracy': 0, 'depth_of_reasoning': 0, 'specificity': 0},
+                'error': str(e),
+            }
+
+    def eval_open_retry(i, q):
+        # Too many requests at once (HTTP 429) is recorded as an error row: wait and try again
+        for attempt in range(6):
+            row = eval_open(i, q)
+            busy = '429' in row.get('error', '') or 'rate_limit' in row.get('error', '')
+            if not busy or attempt == 5:
+                return row
+            time.sleep(min(60, 5 * 2 ** attempt) + _random.random())
+
+    pending = list(enumerate(open_questions))[open_start_idx:]
+    with ThreadPoolExecutor(WORKERS) as pool:
+        # Re-grade rows that failed with an API error in an earlier run
+        failed = [n for n, r in enumerate(open_results) if r.get('error')]
+        if failed:
+            print(f'Retrying {len(failed)} open-ended questions that failed earlier', flush=True)
+            redo = pool.map(lambda n: eval_open_retry(open_results[n]['question_idx'],
+                                                      open_questions[open_results[n]['question_idx']]), failed)
+            for n, row in zip(failed, redo):
+                open_results[n] = row
+        for b in range(0, len(pending), 10):
+            batch = pending[b:b + 10]
+            open_results.extend(pool.map(lambda iq: eval_open_retry(*iq), batch))
+            # Compute averages so far
+            valid = [r['scores'] for r in open_results if r['scores'].get('factual_accuracy', 0) > 0]
+            avg_fa = sum(s['factual_accuracy'] for s in valid) / max(len(valid), 1)
+            avg_dr = sum(s['depth_of_reasoning'] for s in valid) / max(len(valid), 1)
+            avg_sp = sum(s['specificity'] for s in valid) / max(len(valid), 1)
+            print(f'  Open {len(open_results)}/{len(open_questions)}: avg factual={avg_fa:.2f} depth={avg_dr:.2f} specificity={avg_sp:.2f}', flush=True)
+            # Checkpoint
+            open_save = {
+                'model': 'claude-haiku-5-5',
+                'n_questions': len(open_results),
+                'per_question': open_results,
+                'avg_factual_accuracy': avg_fa,
+                'avg_depth_of_reasoning': avg_dr,
+                'avg_specificity': avg_sp,
+            }
+            with open(open_out_file, 'w') as f:
+                json.dump(open_save, f, indent=2)
+
+    # Final save
+    valid = [r['scores'] for r in open_results if r['scores'].get('factual_accuracy', 0) > 0]
+    avg_fa = sum(s['factual_accuracy'] for s in valid) / max(len(valid), 1)
+    avg_dr = sum(s['depth_of_reasoning'] for s in valid) / max(len(valid), 1)
+    avg_sp = sum(s['specificity'] for s in valid) / max(len(valid), 1)
+
+    cov = [r['checklist_coverage']['fraction'] for r in open_results if r.get('checklist_coverage')]
+    open_save = {
+        'model': 'claude-haiku-5-5',
+        'n_questions': len(open_results),
+        'per_question': open_results,
+        'avg_factual_accuracy': avg_fa,
+        'avg_depth_of_reasoning': avg_dr,
+        'avg_specificity': avg_sp,
+        'avg_checklist_coverage': sum(cov) / len(cov) if cov else None,
+    }
+    with open(open_out_file, 'w') as f:
+        json.dump(open_save, f, indent=2)
+
+    print(f'Open-ended evaluation: {len(open_results)} questions')
+    if cov:
+        print(f'  Avg checklist coverage:  {sum(cov) / len(cov):.3f} ({len(cov)} why-questions)')
+    print(f'  Avg factual_accuracy:    {avg_fa:.3f}')
+    print(f'  Avg depth_of_reasoning:  {avg_dr:.3f}')
+    print(f'  Avg specificity:         {avg_sp:.3f}')
+    print(f'Results saved to {open_out_file}')
+else:
+    print('No open-ended questions found; skipping rubric evaluation.')
+"
+PY_STATUS=$?
+
+echo "=== Results ==="
+ls -lh ${DATA_ROOT}/results/eval_*.json 2>/dev/null
+echo "Finished: $(date)"
+exit ${PY_STATUS}

@@ -1,0 +1,51 @@
+# Experiment 4: Sound-World Correlation
+# Investigates correlations between audio features of regional music
+# and socio-economic/cultural indicators from World Bank and FRED.
+
+experiment:
+  name: sound_world_correlation
+  description: "Correlate regional music features with socio-economic indicators"
+
+world_context:
+  sources:
+    - name: world_bank
+      indicators:
+        - NY.GDP.PCAP.CD    # GDP per capita
+        - SP.POP.TOTL       # Total population
+        - SE.ADT.LITR.ZS    # Literacy rate
+        - IT.NET.USER.ZS    # Internet users
+        - SP.URB.TOTL.IN.ZS # Urban population
+    - name: fred
+      series:
+        - CPIAUCSL           # Consumer Price Index
+        - UNRATE             # Unemployment Rate
+        - MEHOINUSA672N      # Median Household Income
+  regions:
+    - North America
+    - Latin America
+    - Western Europe
+    - Eastern Europe
+    - Sub-Saharan Africa
+    - Middle East
+    - South Asia
+    - East Asia
+    - Southeast Asia
+    - Oceania
+
+features:
+  mel_bands: 128
+  hop_lengths: [512, 1024]
+  aggregation:
+    - mean
+    - std
+    - skew
+    - kurtosis
+
+analysis:
+  methods:
+    - pearson_correlation
+    - spearman_correlation
+    - canonical_correlation
+    - mutual_information
+  significance_level: 0.05
+  multiple_testing_correction: bonferroni

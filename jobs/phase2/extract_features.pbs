@@ -1,0 +1,124 @@
+#!/bin/bash
+#PBS -N mw_features
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — feature extraction is embarrassingly parallel signal processing.
+# Chain: each shard processes a slice of the manifest, then submits the next.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+# Import from a node-local copy of the code: cold compute nodes block for minutes on each first
+# file open on scratch (see mw_stage_bundle in _env.sh)
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+
+SHARD=${SHARD:-0}
+MAX_SHARDS=${MAX_SHARDS:-20}
+TRACKS_PER_SHARD=${TRACKS_PER_SHARD:-500}
+
+echo "=== Phase 2A: Feature Extraction (shard ${SHARD}/${MAX_SHARDS}) ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+
+# Done marker
+DONE_MARKER=${DATA_ROOT}/features/.extract_done
+if [ -f "${DONE_MARKER}" ]; then
+    echo "All features already extracted. Exiting."
+    exit 0
+fi
+
+# Chain next shard at start (afterany = runs even if this one fails)
+NEXT_SHARD=$((SHARD + 1))
+if [ "${NEXT_SHARD}" -lt "${MAX_SHARDS}" ] && [ -n "${SHARD}" ] && [ -n "${MAX_SHARDS}" ]; then
+    NEXT_ID=$(qsub -l walltime=02:00:00 -l select=1:ncpus=8:mem=32gb \
+        -v SHARD=${NEXT_SHARD},MAX_SHARDS=${MAX_SHARDS},TRACKS_PER_SHARD=${TRACKS_PER_SHARD} \
+        -W depend=afterany:${PBS_JOBID} \
+        ${REPO}/jobs/phase2/extract_features.pbs)
+    echo "Chained shard ${NEXT_SHARD}: ${NEXT_ID}"
+fi
+
+START_IDX=$((SHARD * TRACKS_PER_SHARD))
+
+${PYTHON} -S -c "
+import sys, signal, time
+sys.path.insert(0, '.')
+from pathlib import Path
+from musicwhy.data.manifest import TrackManifest
+from musicwhy.features.extract import FeatureExtractor
+
+class TrackTimeout(Exception):
+    pass
+
+def _alarm_handler(signum, frame):
+    raise TrackTimeout('Extraction exceeded 420s timeout')
+
+signal.signal(signal.SIGALRM, _alarm_handler)
+
+manifest = TrackManifest(Path('${DATA_ROOT}') / 'manifest.csv')
+all_ids = sorted(manifest.track_ids())
+
+start = ${START_IDX}
+end = min(start + ${TRACKS_PER_SHARD}, len(all_ids))
+
+if start >= len(all_ids):
+    print(f'Shard {${SHARD}} beyond manifest ({len(all_ids)} tracks). Writing done marker.')
+    Path('${DONE_MARKER}').touch()
+    sys.exit(0)
+
+slice_ids = all_ids[start:end]
+print(f'Processing tracks {start}-{end} of {len(all_ids)} ({len(slice_ids)} tracks)', flush=True)
+
+extractor = FeatureExtractor(sr=22050)
+output_dir = Path('${DATA_ROOT}/features')
+output_dir.mkdir(parents=True, exist_ok=True)
+
+done = 0
+skipped = 0
+failed = 0
+for i, tid in enumerate(slice_ids):
+    h5_path = output_dir / f'{tid}.h5'
+    if h5_path.exists() and h5_path.stat().st_size > 500:
+        skipped += 1
+        continue
+    elif h5_path.exists():
+        h5_path.unlink()
+    rec = manifest.get_track(tid)
+    if rec is None:
+        continue
+    try:
+        signal.alarm(420)  # 10-minute MoisesDB songs take several minutes
+        t0 = time.time()
+        features = extractor.extract_single(rec.file_path)
+        signal.alarm(0)
+        n_feats = len(features)
+        n_arrays = sum(1 for v in features.values() if hasattr(v, 'shape'))
+        extractor.save_features(tid, features, str(output_dir))
+        sz = h5_path.stat().st_size if h5_path.exists() else 0
+        if sz < 500:
+            print(f'  WARN {tid}: h5 only {sz}B ({n_feats} features, {n_arrays} arrays) in {time.time()-t0:.1f}s', flush=True)
+            h5_path.unlink(missing_ok=True)
+            failed += 1
+        else:
+            done += 1
+            if done % 10 == 0:
+                print(f'  {done} done, {skipped} skip, {failed} fail ({i+1}/{len(slice_ids)}) [{sz/1024:.0f}KB, {time.time()-t0:.1f}s]', flush=True)
+    except TrackTimeout:
+        signal.alarm(0)
+        failed += 1
+        h5_path.unlink(missing_ok=True)
+        print(f'  TIMEOUT {tid} (>420s)', flush=True)
+    except Exception as e:
+        signal.alarm(0)
+        failed += 1
+        h5_path.unlink(missing_ok=True)
+        print(f'  FAILED {tid}: {type(e).__name__}: {e}', flush=True)
+
+print(f'Shard ${SHARD} complete: {done} extracted, {skipped} skipped, {failed} failed.', flush=True)
+"
+PY_STATUS=$?
+
+echo "=== Features so far ==="
+ls ${DATA_ROOT}/features/*.h5 2>/dev/null | wc -l
+echo "Finished: $(date)"
+exit ${PY_STATUS}

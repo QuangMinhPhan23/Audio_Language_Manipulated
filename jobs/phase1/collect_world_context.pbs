@@ -1,0 +1,55 @@
+#!/bin/bash
+#PBS -N mw_world_ctx
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — builds data/world_context/world_context.db: World Bank + FRED economics, Billboard Hot 100,
+# Wikipedia year-page events (world, music, 15 countries), OxCGRT COVID. Countries are stored as ISO3.
+# Each collector replaces its own rows, so reruns don't duplicate. Wikipedia is ~1,300 pages (~20 min).
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+# Import from a node-local copy of the code: cold compute nodes block for minutes on each first
+# file open on scratch (see mw_stage_bundle in _env.sh)
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+
+echo "=== Phase 1B: World Context Collection ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+
+${PYTHON} -S -c "
+import sys, os, logging
+sys.path.insert(0, '.')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', stream=sys.stdout)
+from musicwhy.data.world_context import WorldContextCollector, WorldContextConfig
+
+cfg = WorldContextConfig(data_root='${DATA_ROOT}/world_context', year_range=(1950, 2025))
+steps = ['collect_billboard', 'collect_covid', 'collect_world_bank', 'collect_wikipedia_events']
+if os.environ.get('FRED_API_KEY'):
+    steps.append('collect_fred')
+else:
+    print('FRED_API_KEY not set, skipping FRED data', flush=True)
+
+failed = []
+with WorldContextCollector(cfg) as collector:
+    for step in steps:
+        print(f'--- {step}', flush=True)
+        try:
+            getattr(collector, step)()
+        except Exception:
+            logging.exception('%s failed', step)
+            failed.append(step)
+    rows = {t: collector.conn.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
+            for t in ('economic', 'chart_entries', 'events', 'covid')}
+print(f'Row counts: {rows}', flush=True)
+if failed:
+    sys.exit(f'Failed steps: {failed}')
+print('World context collection complete.', flush=True)
+"
+PY_STATUS=$?
+
+echo "=== Output files ==="
+ls -lh ${DATA_ROOT}/world_context/ 2>/dev/null || echo "No output yet"
+echo "Finished: $(date)"
+exit ${PY_STATUS}

@@ -1,0 +1,21 @@
+#!/bin/bash
+#PBS -N mw_memory
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — Claim 3 probe (scripts/memory_probe.py): can a text model answer questions about a hit's
+# sound from its name alone? API-bound, so cput stays near zero; judge progress by the results file.
+# Env: LIMIT (songs; 0 = all), CONDITIONS (default era,name,measured), MODEL. Reruns resume.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+
+echo "=== Memory probe ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+export LIMIT=${LIMIT:-0} CONDITIONS=${CONDITIONS:-era,name,measured} MODEL=${MODEL:-claude-haiku-5-5}
+${PYTHON} -S ${CODE_ROOT}/scripts/memory_probe.py
+echo "Finished: $(date)"

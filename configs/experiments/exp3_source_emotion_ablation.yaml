@@ -1,0 +1,44 @@
+# Experiment 3: Source Separation Emotion Ablation
+# Studies how individual stems (vocals, drums, bass, other) contribute
+# to emotion recognition accuracy.
+
+experiment:
+  name: source_emotion_ablation
+  description: "Ablation study on source-separated stems for emotion recognition"
+
+separation:
+  model: htdemucs
+  stems: 4
+  device: cuda
+
+ablation:
+  conditions:
+    - name: full_mix
+      stems: [vocals, drums, bass, other]
+    - name: vocals_only
+      stems: [vocals]
+    - name: no_vocals
+      stems: [drums, bass, other]
+    - name: drums_only
+      stems: [drums]
+    - name: bass_only
+      stems: [bass]
+    - name: other_only
+      stems: [other]
+    - name: melodic
+      stems: [vocals, other]
+    - name: rhythmic
+      stems: [drums, bass]
+
+annotation:
+  llm_provider: anthropic
+  llm_model: claude-sonnet-4-20250514
+  max_tokens: 2000
+  temperature: 0.3
+
+evaluation:
+  task: emotion_recognition
+  metrics:
+    - accuracy
+    - f1_macro
+    - confusion_matrix

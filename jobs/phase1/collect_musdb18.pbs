@@ -1,0 +1,76 @@
+#!/bin/bash
+#PBS -N mw_musdb18
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — makes data/raw/musdb18hq match the MUSDB18-HQ zip on Zenodo (150 tracks x 5 wavs).
+# Reads the 23 GB zip in place over HTTP Range requests and fetches only wavs that are missing or
+# the wrong size, so a backfill costs a few GB of download and no extra scratch for the zip.
+# (The first download ran out of quota mid-extraction and left 11 test tracks and one train
+# track missing.) Also fetches sigsep's tracklist.csv, which build_manifest uses for genre/license.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+# Import from a node-local copy of the code: cold compute nodes block for minutes on each first
+# file open on scratch (see mw_stage_bundle in _env.sh)
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+
+DEST=${DATA_ROOT}/raw/musdb18hq
+DONE_MARKER=${DEST}/.download_complete
+
+echo "=== Phase 1A: MUSDB18-HQ sync ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+
+${PYTHON} -S -c "
+import os, sys, shutil
+sys.path.insert(0, '.')
+from pathlib import Path
+import requests
+from musicwhy.data.remote_zip import open_remote_zip
+from musicwhy.data.source_meta import load_musdb_tracklist
+
+DEST = Path('${DEST}')
+DEST.mkdir(parents=True, exist_ok=True)
+
+record = requests.get('https://zenodo.org/api/records/3338373', timeout=30)
+record.raise_for_status()
+zips = [f for f in record.json().get('files', []) if f['key'].endswith('.zip')]
+if not zips:
+    sys.exit('ERROR: no zip in Zenodo record 3338373')
+zf = open_remote_zip(zips[0]['links']['self'])
+
+wavs = [i for i in zf.infolist() if i.filename.endswith('.wav') and not i.is_dir()]
+todo = [i for i in wavs if not (DEST / i.filename).exists() or (DEST / i.filename).stat().st_size != i.file_size]
+print(f'Zip lists {len(wavs)} wavs; {len(todo)} missing or wrong size ({sum(i.file_size for i in todo) / 1e9:.1f} GB)', flush=True)
+
+for n, info in enumerate(todo, 1):
+    out = DEST / info.filename
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + '.part')
+    with zf.open(info) as src, open(tmp, 'wb') as dst:
+        shutil.copyfileobj(src, dst, length=16 << 20)
+    tmp.replace(out)
+    print(f'  [{n}/{len(todo)}] {info.filename} ({info.file_size / 1e6:.0f} MB)', flush=True)
+
+tracks = {}
+for i in wavs:
+    tracks.setdefault(os.path.dirname(i.filename), []).append(i)
+complete = sum(1 for d, items in tracks.items()
+               if all((DEST / i.filename).exists() and (DEST / i.filename).stat().st_size == i.file_size for i in items))
+msg = f'{complete}/{len(tracks)} tracks complete'
+print(msg, flush=True)
+(Path('${DONE_MARKER}')).write_text(msg + '\n')
+
+tl = load_musdb_tracklist(DEST / 'tracklist.csv')
+print(f'tracklist.csv: {len(tl)} tracks with genre/license', flush=True)
+if complete != len(tracks):
+    sys.exit(1)
+"
+PY_STATUS=$?
+
+echo "=== Disk after sync ==="
+du -sh ${DEST} 2>/dev/null
+echo "Finished: $(date)"
+exit ${PY_STATUS}

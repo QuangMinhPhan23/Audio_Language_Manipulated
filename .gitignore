@@ -1,0 +1,47 @@
+# Data files
+data/
+*.h5
+*.wav
+*.mp3
+*.flac
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Experiment outputs
+wandb/
+outputs/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ARIS (junctions into ~/aris_repo; recreate with tools/install_aris.ps1)
+.aris/
+.claude/skills/
+.claude/agents/aris-fanout-leaf.md

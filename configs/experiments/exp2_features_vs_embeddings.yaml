@@ -1,0 +1,45 @@
+# Experiment 2: Handcrafted Features vs. Learned Embeddings
+# Compares the effectiveness of traditional audio features against neural embeddings
+# when used as context for LLM-based music understanding.
+
+experiment:
+  name: features_vs_embeddings
+  description: "Compare handcrafted features and learned embeddings as LLM context"
+
+features:
+  handcrafted:
+    mel_bands: 128
+    hop_lengths:
+      - 512
+      - 1024
+      - 2048
+    n_mfcc: 20
+    include:
+      - mfcc
+      - chroma
+      - spectral_centroid
+      - spectral_bandwidth
+      - spectral_rolloff
+      - zero_crossing_rate
+      - rms_energy
+      - tonnetz
+  embeddings:
+    models:
+      - openl3
+      - clap
+      - musicnn
+    pooling:
+      - mean
+      - max
+      - attention
+
+evaluation:
+  models:
+    - claude-sonnet-4-20250514
+  tasks:
+    - emotion_recognition
+    - genre_classification
+    - instrument_detection
+  metrics:
+    - accuracy
+    - f1_macro

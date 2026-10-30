@@ -1,0 +1,69 @@
+#!/bin/bash
+#PBS -N mw_annotate
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — Phase 3 reasoning annotation via the Anthropic API (scripts/annotate.py).
+# One shard covers all tracks by default; existing annotation files are skipped, so reruns resume.
+# Cold compute nodes can take minutes to import Python packages from scratch (each first file open
+# on GPFS is slow), so a startup watchdog bounces the job only if imports exceed STARTUP_TIMEOUT.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+
+SHARD=${SHARD:-0}
+TRACKS_PER_SHARD=${TRACKS_PER_SHARD:-140}
+BOUNCE=${BOUNCE:-0}
+MAX_BOUNCE=5
+STARTUP_TIMEOUT=900
+
+echo "=== Phase 3: Reasoning Annotation (shard ${SHARD}, bounce ${BOUNCE}) ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+
+if [ -f "${DATA_ROOT}/annotations/.annotate_done" ]; then
+    echo "All annotations complete. Exiting."
+    exit 0
+fi
+
+RUN_LOG=/tmp/mw_annotate_${PBS_JOBID%%.*}.log
+mw_stage_bundle || exit 1
+
+# -S: skip site, so Python never scans the venv on scratch; PYTHONPATH (set by mw_stage_bundle) is local
+export SHARD TRACKS_PER_SHARD
+${PYTHON} -S -X importtime ${CODE_ROOT}/scripts/annotate.py > "${RUN_LOG}" 2>&1 &
+PY_PID=$!
+
+WAITED=0
+while ! grep -q "Annotating tracks\|beyond manifest" "${RUN_LOG}" 2>/dev/null; do
+    kill -0 ${PY_PID} 2>/dev/null || { echo "Python exited during startup"; break; }
+    if [ "${WAITED}" -ge "${STARTUP_TIMEOUT}" ]; then
+        echo "Python stalled ${WAITED}s during startup on $(hostname); bouncing."
+        echo "Last imports completed before the stall:"
+        grep "import time:" "${RUN_LOG}" | tail -4
+        kill -9 ${PY_PID} 2>/dev/null
+        if [ "${BOUNCE}" -lt "${MAX_BOUNCE}" ]; then
+            NEW_ID=$(qsub -l walltime=02:00:00 -l select=1:ncpus=4:mem=16gb \
+                -v SHARD=${SHARD},TRACKS_PER_SHARD=${TRACKS_PER_SHARD},BOUNCE=$((BOUNCE + 1)) \
+                ${REPO}/jobs/phase3/annotate_reasoning.pbs)
+            echo "Resubmitted as ${NEW_ID}"
+        else
+            echo "Hit MAX_BOUNCE=${MAX_BOUNCE}; giving up."
+        fi
+        exit 0
+    fi
+    sleep 10
+    WAITED=$((WAITED + 10))
+done
+echo "Python reached annotation loop after ~${WAITED}s"
+
+wait ${PY_PID}
+PY_STATUS=$?
+grep -v "import time:" "${RUN_LOG}"
+rm -f "${RUN_LOG}"
+
+echo "=== Annotations so far ==="
+ls ${DATA_ROOT}/annotations/*.json 2>/dev/null | wc -l
+echo "Finished: $(date)"
+exit ${PY_STATUS}

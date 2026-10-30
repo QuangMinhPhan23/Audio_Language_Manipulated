@@ -1,0 +1,33 @@
+# Experiment 1: Benchmark Evaluation
+# Evaluates LLM performance on the MusicWhy benchmark across all task types.
+
+experiment:
+  name: benchmark_eval
+  description: "End-to-end benchmark evaluation of LLMs on MusicWhy tasks"
+
+benchmark:
+  val_ratio: 0.1
+  test_ratio: 0.9
+  tasks:
+    - emotion_recognition
+    - genre_classification
+    - instrument_detection
+    - key_detection
+    - tempo_estimation
+    - structure_analysis
+
+evaluation:
+  models:
+    - claude-sonnet-4-20250514
+    - gpt-4o
+    - gemini-1.5-pro
+  judge_model: gpt-4o
+  num_runs: 3
+  metrics:
+    - accuracy
+    - f1_macro
+    - cohens_kappa
+
+annotation:
+  max_tokens: 2000
+  temperature: 0.3

@@ -1,0 +1,16 @@
+#!/bin/bash
+#PBS -N mw_p0_tagcmp
+#PBS -l select=1:ncpus=4:mem=32gb:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# GPU job — run all 3 instrument taggers (Jamendo, PaSST, CLAP) on the listening-pack clips and compute
+# majority votes. Output: data/phase0/listening_pack/tagger_results.json.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+echo "=== Phase 0: tagger comparison ==="
+echo "Started: $(date)  Node: $(hostname)"
+"${VERIFY_PYTHON}" -I scripts/phase0_tagger_compare.py || exit 1
+echo "Finished: $(date)"

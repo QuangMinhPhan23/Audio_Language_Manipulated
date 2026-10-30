@@ -1,0 +1,16 @@
+#!/bin/bash
+#PBS -N mw_p0_listen
+#PBS -l select=1:ncpus=4:mem=32gb:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# GPU job — 12-clip blind listening pack (scripts/phase0_listening_pack.py): does ACE-Step make the requested
+# instrument lead? Output: data/phase0/listening_pack/.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+echo "=== Phase 0: listening pack ==="
+echo "Started: $(date)  Node: $(hostname)"
+"${ACESTEP_PYTHON}" -I scripts/phase0_listening_pack.py || exit 1
+echo "Finished: $(date)"

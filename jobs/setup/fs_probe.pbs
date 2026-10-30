@@ -1,0 +1,13 @@
+#!/bin/bash
+#PBS -N mw_fsprobe
+#PBS -l select=1:ncpus=2:mem=4gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# Diagnose Python startup stalls on compute nodes: times filesystem steps and interpreter starts.
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+bash ${REPO}/scripts/fs_probe.sh
+echo "=== same checks after sourcing env, as the annotation job does ==="
+timeout -k 2 30 ${PYTHON} -I -X importtime -c "import sys; sys.path.insert(0, '.'); import musicwhy.data.manifest, musicwhy.features.extract, musicwhy.annotation.llm_reasoning; print('imports ok')" 2>&1 | tail -3
+echo "rc=$?"

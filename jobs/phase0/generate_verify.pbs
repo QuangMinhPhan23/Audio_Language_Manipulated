@@ -1,0 +1,28 @@
+#!/bin/bash
+#PBS -N mw_p0_genver
+#PBS -l select=1:ncpus=8:mem=48gb:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# GPU job — generates clips for songs START..START+COUNT-1.
+# MIDI clips (instrument/tempo/mode) are rendered with tinysoundfont (VERIFY_PYTHON, fast, no GPU).
+# ACE-Step clips (vocals) are generated on GPU (ACESTEP_PYTHON, slower).
+# Then measures each clip; only accepted clips and a 5% sample of rejects reach scratch.
+# Env: START (default 0), COUNT (songs, default 10). Clips already in data/phase0/clips.jsonl are skipped.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+START=${START:-0}
+COUNT=${COUNT:-10}
+CLIPS="${TMPDIR}/p0_clips"
+echo "=== Phase 0: generate + verify songs ${START}..$((START + COUNT - 1)) ==="
+echo "Started: $(date)  Node: $(hostname)  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
+
+${VERIFY_PYTHON} -I scripts/phase0_generate.py --source midi --start ${START} --count ${COUNT} --out-dir "${CLIPS}" || exit 1
+"${ACESTEP_PYTHON}" -I scripts/phase0_generate.py --source acestep --start ${START} --count ${COUNT} --out-dir "${CLIPS}" || exit 1
+echo "Generated: $(date)"
+${VERIFY_PYTHON} -I scripts/phase0_verify.py --clips-dir "${CLIPS}" || exit 1
+${PYTHON} -I scripts/phase0_report.py | head -30
+df -h /srv/scratch/z5531827 | tail -1
+echo "Finished: $(date)"

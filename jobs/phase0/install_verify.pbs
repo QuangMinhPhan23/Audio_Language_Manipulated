@@ -1,0 +1,70 @@
+#!/bin/bash
+#PBS -N mw_p0_verify_install
+#PBS -l select=1:ncpus=8:mem=48gb:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# GPU job — builds the verify venv and downloads the measuring tools' models. The venv overlays the main one
+# (a .pth file puts .venv's packages on its path), so torch, demucs and librosa are shared and only the extra
+# tools are installed; pip never touches the main venv ("outside environment"). Reruns skip finished steps.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+echo "=== Phase 0: install verify tools ==="
+echo "Started: $(date)  Node: $(hostname)  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
+
+if [ ! -x "${VERIFY_PYTHON}" ]; then
+    python3.11 -m venv ${REPO}/.venv_verify || exit 1
+    echo "${REPO}/.venv/lib/python3.11/site-packages" \
+        > ${REPO}/.venv_verify/lib/python3.11/site-packages/main_venv.pth
+fi
+VPIP="${VERIFY_PYTHON} -m pip install -q --no-cache-dir"
+${VPIP} essentia-tensorflow hear21passt "git+https://github.com/CPJKU/beat_this" 2>&1 | tail -5
+${VPIP} --no-deps tinysoundfont 2>&1 | tail -3  # its pyaudio dependency is only for live playback
+${VPIP} "git+https://github.com/CPJKU/madmom" 2>&1 | tail -3 \
+    || echo "madmom did not install; Essentia RhythmExtractor2013 will be the second tempo tool"
+if ! ${VERIFY_PYTHON} -c "import essentia.standard" 2>/dev/null; then
+    echo "essentia does not import against NumPy $(${VERIFY_PYTHON} -c 'import numpy; print(numpy.__version__)'); trying numpy<2 in the overlay"
+    ${VPIP} "numpy<2" 2>&1 | tail -3
+fi
+${VERIFY_PYTHON} -c "import essentia.standard, tinysoundfont, beat_this, hear21passt, demucs, torch; print('imports ok, torch', torch.__version__)" || exit 1
+
+mkdir -p ${PHASE0_MODELS} && cd ${PHASE0_MODELS}
+E=https://essentia.upf.edu/models
+for url in ${E}/feature-extractors/discogs-effnet/discogs-effnet-bs64-1.pb \
+           ${E}/classification-heads/mtg_jamendo_instrument/mtg_jamendo_instrument-discogs-effnet-1.pb \
+           ${E}/classification-heads/mtg_jamendo_instrument/mtg_jamendo_instrument-discogs-effnet-1.json \
+           http://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/class_labels_indices.csv \
+           https://ftp.osuosl.org/pub/musescore/soundfont/MuseScore_General/MuseScore_General.sf2; do
+    f=$(basename "$url")
+    [ -s "$f" ] || curl -sfL -o "$f" "$url" || { echo "download failed: $url"; exit 1; }
+done
+echo "--- CLAP music model (laion/larger_clap_music, ~740 MB) ---"
+if [ ! -s "${PHASE0_MODELS}/clap_music/pytorch_model.bin" ]; then
+    ${VERIFY_PYTHON} -I -c "
+from huggingface_hub import snapshot_download
+snapshot_download('laion/larger_clap_music', local_dir='${PHASE0_MODELS}/clap_music')
+print('CLAP downloaded')
+" || echo "WARNING: CLAP download failed; instrument tagger will fall back to 2-tagger mode"
+fi
+ls -la ${PHASE0_MODELS}
+ls -la ${PHASE0_MODELS}/clap_music/ 2>/dev/null || echo "(no clap_music dir)"
+cd ${REPO}
+
+echo "=== Smoke test: every tool on a 20-second click track ==="
+${VERIFY_PYTHON} -I -c "
+import sys, numpy as np, soundfile as sf
+sys.path.insert(0, '.')
+from musicwhy.stimuli.measure import Measurer
+sr, bpm = 44100, 120
+t = np.arange(20 * sr) / sr
+audio = 0.3 * np.sin(2 * np.pi * 440 * t) * (np.mod(t, 60 / bpm) < 0.05)
+sf.write('${TMPDIR}/click.wav', np.stack([audio, audio], 1), sr)
+m = Measurer()
+print('tempo tools:', m.tempo_a, m.tempo_b)
+print(m.measure_clip('${TMPDIR}/click.wav'))
+" || exit 1
+echo "Overlay size: $(du -sh ${REPO}/.venv_verify | cut -f1); models: $(du -sh ${PHASE0_MODELS} | cut -f1)"
+df -h /srv/scratch/z5531827 | tail -1
+echo "Finished: $(date)"

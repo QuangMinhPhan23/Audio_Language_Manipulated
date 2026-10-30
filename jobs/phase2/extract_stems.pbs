@@ -1,0 +1,152 @@
+#!/bin/bash
+#PBS -N mw_stems
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — extracts audio features for each stem file (bass, drums, vocals, other).
+# Stems are analysed over the whole song, the same window as the full-mix features, so the
+# stem-vs-mix comparisons in annotations are like for like. (An earlier version used only the
+# first 30 s: a bass silent in the intro got a noise "brightness" of 5000 Hz and 0% energy.)
+# Brightness and bandwidth are energy-weighted, so silent frames don't count; activity_ratio is
+# the share of frames above -50 dBFS. Stem tempo uses the mix tempo as the beat tracker's prior,
+# which stops half/double-tempo readings (bass 161 BPM vs drums 81 on the same song).
+#
+# Parallel: submit N jobs with -v SHARD=i,N_SHARDS=N; shard i takes every N-th track.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+# Import from a node-local copy of the code: cold compute nodes block for minutes on each first
+# file open on scratch (see mw_stage_bundle in _env.sh)
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+
+SHARD=${SHARD:-0}
+N_SHARDS=${N_SHARDS:-1}
+
+echo "=== Phase 2B: Stem Feature Extraction (shard ${SHARD}/${N_SHARDS}) ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+
+${PYTHON} -S -c "
+import sys, json, time, signal
+sys.path.insert(0, '.')
+from pathlib import Path
+import numpy as np
+import soundfile as sf
+import librosa
+import h5py
+
+from musicwhy.data.light_io import load_manifest
+from musicwhy.features.feature_to_language import dynamic_range_db
+
+class TrackTimeout(Exception):
+    pass
+
+def _alarm_handler(signum, frame):
+    raise TrackTimeout('Stem extraction exceeded 180s timeout')
+
+signal.signal(signal.SIGALRM, _alarm_handler)
+
+SR = 22050
+MAX_SECONDS = 600
+SILENCE_RMS = 10 ** (-50 / 20)  # frame RMS below -50 dBFS counts as silent
+STEM_NAMES = ['bass', 'drums', 'vocals', 'other']
+
+data_root = Path('${DATA_ROOT}')
+manifest = load_manifest(data_root)
+all_ids = sorted(manifest)[${SHARD}::${N_SHARDS}]
+stems_dir = data_root / 'features' / 'stems'
+stems_dir.mkdir(parents=True, exist_ok=True)
+
+def weighted_mean(x, w):
+    n = min(len(x), len(w))
+    total = float(w[:n].sum())
+    return float((x[:n] * w[:n]).sum() / total) if total > 0 else 0.0
+
+def mix_tempo(tid):
+    try:
+        with h5py.File(data_root / 'features' / f'{tid}.h5', 'r') as f:
+            return float(f.attrs['tempo'])
+    except Exception:
+        return None
+
+def extract_stem_features(audio_path, prior_tempo):
+    data, sr = sf.read(str(audio_path), dtype='float32', always_2d=True)
+    data = data.mean(axis=1)
+    if sr != SR:
+        data = librosa.resample(data, orig_sr=sr, target_sr=SR)
+    data = data[:MAX_SECONDS * SR]
+    rms = librosa.feature.rms(y=data)[0]
+    weights = rms ** 2
+    active = rms > SILENCE_RMS
+    sc = librosa.feature.spectral_centroid(y=data, sr=SR)[0]
+    bw = librosa.feature.spectral_bandwidth(y=data, sr=SR)[0]
+    if active.mean() >= 0.05:
+        kwargs = {'start_bpm': prior_tempo} if prior_tempo else {}
+        tempo_arr, _ = librosa.beat.beat_track(y=data, sr=SR, **kwargs)
+        tempo = float(np.atleast_1d(tempo_arr)[0])
+    else:
+        tempo = 0.0  # nothing to track in a silent stem
+    y_h, y_p = librosa.effects.hpss(data)
+    hp = float(np.sum(y_h ** 2) / (np.sum(y_p ** 2) + 1e-10))
+    onset = librosa.onset.onset_strength(y=data, sr=SR)
+    return {
+        'tempo': tempo,
+        'spectral_centroid': np.round(sc, 1).tolist(),
+        'spectral_centroid_mean': weighted_mean(sc, weights),
+        'spectral_bandwidth_mean': weighted_mean(bw, weights),
+        'harmonic_percussive_ratio': hp,
+        'dynamic_range': float(np.max(rms) - np.min(rms)),
+        'dynamic_range_db': dynamic_range_db(rms),
+        'rms_mean': float(np.mean(rms)),
+        'activity_ratio': float(active.mean()),
+        'onset_strength_mean': float(np.mean(onset)),
+        'duration': len(data) / SR,
+        'window': 'full_track',
+    }
+
+print(f'Processing {len(all_ids)} tracks x {len(STEM_NAMES)} stems', flush=True)
+done = skipped = failed = 0
+
+for i, tid in enumerate(all_ids):
+    song_dir = Path(manifest[tid]['file_path']).parent
+    prior = mix_tempo(tid)
+    for stem_name in STEM_NAMES:
+        out_file = stems_dir / f'{tid}_{stem_name}.json'
+        if out_file.exists() and out_file.stat().st_size > 10:
+            skipped += 1
+            continue
+        # MUSDB stems are .wav; the MoisesDB converter writes .flac
+        stem_file = next((song_dir / f'{stem_name}{ext}' for ext in ('.wav', '.flac')
+                          if (song_dir / f'{stem_name}{ext}').exists()), None)
+        if stem_file is None:
+            continue
+        try:
+            signal.alarm(180)
+            feats = extract_stem_features(stem_file, prior)
+            signal.alarm(0)
+            tmp = out_file.with_suffix('.json.part')
+            with open(tmp, 'w') as f:
+                json.dump(feats, f)
+            tmp.replace(out_file)
+            done += 1
+        except TrackTimeout:
+            signal.alarm(0)
+            failed += 1
+            print(f'  TIMEOUT {tid}/{stem_name} (>180s)', flush=True)
+        except Exception as e:
+            signal.alarm(0)
+            failed += 1
+            print(f'  FAILED {tid}/{stem_name}: {type(e).__name__}: {e}', flush=True)
+    if (i + 1) % 10 == 0:
+        print(f'  {i+1}/{len(all_ids)} tracks: {done} extracted, {skipped} skipped, {failed} failed', flush=True)
+
+print(f'Complete: {done} stem features extracted, {skipped} skipped, {failed} failed.', flush=True)
+sys.exit(1 if failed else 0)
+"
+PY_STATUS=$?
+
+echo "=== Stem features ==="
+ls ${DATA_ROOT}/features/stems/*.json 2>/dev/null | wc -l
+echo "Finished: $(date)"
+exit ${PY_STATUS}

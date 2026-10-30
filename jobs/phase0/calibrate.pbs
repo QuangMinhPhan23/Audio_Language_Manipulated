@@ -1,0 +1,16 @@
+#!/bin/bash
+#PBS -N mw_p0_calib
+#PBS -l select=1:ncpus=8:mem=48gb:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# GPU job — Test 4.1: run the measuring tools on 50 rendered-MIDI clips (known tempo, mode, instrument) and
+# 50 MUSDB18-HQ excerpts (known vocals). Results: data/phase0/calibration/results.json. Reruns reuse clips.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+echo "=== Phase 0: calibrate measuring tools ==="
+echo "Started: $(date)  Node: $(hostname)  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
+${VERIFY_PYTHON} -I scripts/phase0_calibrate.py || exit 1
+echo "Finished: $(date)"

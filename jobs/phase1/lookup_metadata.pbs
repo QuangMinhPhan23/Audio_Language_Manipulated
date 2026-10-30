@@ -1,0 +1,79 @@
+#!/bin/bash
+#PBS -N mw_metadata
+#PBS -l select=1:ncpus=2:mem=4gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — release year for each song from MusicBrainz, iTunes and Deezer (musicwhy/data/year_lookup.py).
+# Artist and title must both match, and the year can't be later than the dataset's release; the
+# earliest surviving candidate wins. Every candidate is saved to data/metadata/year_lookup.json, which
+# also makes reruns resume. FORCE=1 re-queries songs already in that file. Verified web-search years
+# (data/metadata/year_websearch.json, written by the song-release-years workflow) are merged in.
+# Stdlib only, so no code bundle is needed.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+
+echo "=== Phase 1B: Release-year lookup (force=${FORCE:-0}) ==="
+echo "Started: $(date)"
+
+${PYTHON} -I -c "
+import sys, csv, json, collections
+sys.path.insert(0, '.')
+from pathlib import Path
+from musicwhy.data.year_lookup import find_year
+
+FORCE = '${FORCE:-0}' == '1'
+data_root = Path('${DATA_ROOT}')
+manifest_path = data_root / 'manifest.csv'
+evidence_path = data_root / 'metadata' / 'year_lookup.json'
+evidence_path.parent.mkdir(parents=True, exist_ok=True)
+evidence = json.loads(evidence_path.read_text()) if evidence_path.exists() else {}
+web_path = data_root / 'metadata' / 'year_websearch.json'
+web = json.loads(web_path.read_text()) if web_path.exists() else {}
+print(f'{len(web)} web-search years from {web_path.name}', flush=True)
+
+with open(manifest_path, newline='', encoding='utf-8') as f:
+    reader = csv.DictReader(f)
+    fieldnames = reader.fieldnames
+    rows = list(reader)
+print(f'Loaded {len(rows)} tracks; {len(evidence)} already looked up', flush=True)
+
+def save():
+    tmp = evidence_path.with_suffix('.json.part')
+    tmp.write_text(json.dumps(evidence, indent=1))
+    tmp.replace(evidence_path)
+    with open(manifest_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_NONNUMERIC)
+        w.writeheader()
+        w.writerows(rows)
+
+done = 0
+for row in rows:
+    tid = row['track_id']
+    if tid not in evidence or FORCE:
+        evidence[tid] = dict(find_year(row['artist'], row['title'], row['source']),
+                             artist=row['artist'], title=row['title'])
+        done += 1
+        e = evidence[tid]
+        print(f'  {row[\"artist\"]} - {row[\"title\"]}: {e[\"year\"] or \"-\"} ({e[\"from\"]}; '
+              f'{len(e[\"candidates\"])} candidates, {len(e[\"rejected\"])} rejected)', flush=True)
+        if done % 20 == 0:
+            save()
+    # Years found by web search (see year_websearch.json) were checked by a second agent for being the
+    # same act, while API matches only compare names; so a web year wins when both exist (an iTunes
+    # 'Secretariat' from 2006 was a namesake of the band whose 2014 album has 'Over the Top')
+    web_year = int(web.get(tid, {}).get('year') or 0)
+    row['year'] = web_year or evidence[tid]['year']
+save()
+
+sources = collections.Counter('websearch' if r['track_id'] in web else evidence[r['track_id']]['from']
+                              for r in rows if int(r['year'] or 0))
+by_dataset = collections.Counter(r['source'] for r in rows if int(r['year'] or 0))
+print(f'Done: {done} looked up; years for {sum(by_dataset.values())}/{len(rows)} songs; '
+      f'by source {dict(sources)}; by dataset {dict(by_dataset)}', flush=True)
+"
+PY_STATUS=$?
+
+echo "Finished: $(date)"
+exit ${PY_STATUS}

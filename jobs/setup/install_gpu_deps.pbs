@@ -1,0 +1,40 @@
+#!/bin/bash
+#PBS -N mw_gpu_deps
+#PBS -l select=1:ncpus=8:mem=48gb:ngpus=1
+#PBS -j oe
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+
+echo "=== Installing GPU deps ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none')"
+
+pip install --no-cache-dir \
+    torch \
+    torchaudio \
+    demucs \
+    transformers \
+    accelerate \
+    2>&1 | tail -20
+
+echo "=== Verifying ==="
+${PYTHON} -c "
+import torch
+print(f'PyTorch {torch.__version__}')
+print(f'CUDA available: {torch.cuda.is_available()}')
+if torch.cuda.is_available():
+    print(f'GPU: {torch.cuda.get_device_name(0)}')
+    print(f'VRAM: {torch.cuda.get_device_properties(0).total_memory / 2**30:.1f} GB')
+"
+
+${PYTHON} -c "
+from demucs.pretrained import get_model
+model = get_model('htdemucs')
+print(f'Demucs htdemucs loaded: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params')
+"
+
+echo "Venv size: $(du -sh .venv | cut -f1)"
+df -h /srv/scratch | tail -1
+echo "Finished: $(date)"

@@ -1,0 +1,110 @@
+#!/bin/bash
+#PBS -N mw_separate
+#PBS -l select=1:ncpus=8:mem=48gb:ngpus=1
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# GPU job — Demucs source separation.
+# Chained 2h shards; each processes TRACKS_PER_SHARD tracks then hands off.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+
+SHARD=${SHARD:-0}
+MAX_SHARDS=${MAX_SHARDS:-30}
+TRACKS_PER_SHARD=${TRACKS_PER_SHARD:-50}
+BOUNCE=${BOUNCE:-0}
+
+echo "=== Phase 2B: Source Separation (shard ${SHARD}/${MAX_SHARDS}, bounce ${BOUNCE}) ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+
+# Guard: check GPU memory, bounce if too small
+GPU_GB=$(${PYTHON} -c "import torch; print(int(torch.cuda.get_device_properties(0).total_memory / 2**30))" 2>/dev/null || echo 0)
+echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null), ${GPU_GB} GB VRAM"
+
+if [ "$GPU_GB" -lt 6 ]; then
+    echo "GPU too small (${GPU_GB} GB < 6 GB). Bouncing..."
+    if [ "$BOUNCE" -lt 25 ]; then
+        qsub -l walltime=02:00:00 -l select=1:ncpus=8:mem=48gb:ngpus=1 \
+            -v SHARD=${SHARD},MAX_SHARDS=${MAX_SHARDS},TRACKS_PER_SHARD=${TRACKS_PER_SHARD},BOUNCE=$((BOUNCE+1)) \
+            ${REPO}/jobs/phase2/separate_sources.pbs
+    fi
+    exit 0
+fi
+
+# Done marker
+DONE_MARKER=${DATA_ROOT}/stems/.separate_done
+if [ -f "${DONE_MARKER}" ]; then
+    echo "All separation complete. Exiting."
+    exit 0
+fi
+
+# Chain next shard BEFORE doing work
+NEXT_SHARD=$((SHARD + 1))
+if [ "${NEXT_SHARD}" -lt "${MAX_SHARDS}" ] && [ -n "${SHARD}" ] && [ -n "${MAX_SHARDS}" ]; then
+    NEXT_ID=$(qsub -l walltime=02:00:00 -l select=1:ncpus=8:mem=48gb:ngpus=1 \
+        -v SHARD=${NEXT_SHARD},MAX_SHARDS=${MAX_SHARDS},TRACKS_PER_SHARD=${TRACKS_PER_SHARD},BOUNCE=0 \
+        -W depend=afterany:${PBS_JOBID} \
+        ${REPO}/jobs/phase2/separate_sources.pbs)
+    echo "Chained shard ${NEXT_SHARD}: ${NEXT_ID}"
+fi
+
+START_IDX=$((SHARD * TRACKS_PER_SHARD))
+
+${PYTHON} -I -c "
+import sys, os
+sys.path.insert(0, '.')
+from pathlib import Path
+from musicwhy.data.manifest import TrackManifest
+from musicwhy.features.separate import SourceSeparator
+
+manifest = TrackManifest(Path('${DATA_ROOT}') / 'manifest.csv')
+all_ids = sorted(manifest.track_ids())
+
+start = ${START_IDX}
+end = min(start + ${TRACKS_PER_SHARD}, len(all_ids))
+
+if start >= len(all_ids):
+    print(f'Shard ${SHARD} beyond manifest ({len(all_ids)} tracks). Writing done marker.')
+    Path('${DATA_ROOT}/stems/.separate_done').touch()
+    sys.exit(0)
+
+slice_ids = all_ids[start:end]
+print(f'Separating tracks {start}-{end} ({len(slice_ids)} tracks)')
+
+separator = SourceSeparator(model_name='htdemucs', device='cuda')
+stems_dir = Path('${DATA_ROOT}/stems')
+stems_dir.mkdir(parents=True, exist_ok=True)
+
+done = 0
+for tid in slice_ids:
+    stem_subdir = stems_dir / tid
+    # compress_demucs_stems.pbs re-encodes finished stems as FLAC
+    if stem_subdir.exists() and len(list(stem_subdir.glob('*.wav')) + list(stem_subdir.glob('*.flac'))) >= 4:
+        done += 1
+        continue
+
+    rec = manifest.get_track(tid)
+    if rec is None:
+        continue
+    # Tracks with real multitrack stems (MUSDB, MoisesDB) don't need Demucs; the MUSDB ones already
+    # separated are kept as a Demucs-vs-truth quality reference.
+    if rec.has_stems:
+        continue
+
+    try:
+        stems = separator.separate_track(rec.file_path)
+        separator.save_stems(tid, stems, str(stems_dir))
+        done += 1
+        if done % 10 == 0:
+            print(f'  {done}/{len(slice_ids)} done')
+    except Exception as e:
+        print(f'  FAILED {tid}: {e}')
+
+print(f'Shard ${SHARD} complete: {done}/{len(slice_ids)} tracks separated.')
+"
+
+echo "=== Stems so far ==="
+ls -d ${DATA_ROOT}/stems/*/ 2>/dev/null | wc -l
+echo "Finished: $(date)"

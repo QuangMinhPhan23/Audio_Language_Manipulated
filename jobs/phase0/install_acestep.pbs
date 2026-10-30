@@ -1,0 +1,55 @@
+#!/bin/bash
+#PBS -N mw_p0_ace_install
+#PBS -l select=1:ncpus=8:mem=48gb:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# GPU job — installs ACE-Step 1.5 in its own venv at a pinned commit, downloads only the renderer weights
+# (DiT turbo, VAE, text encoder; never the planner LM) and generates one song's 15 clips as a smoke test.
+# Reruns skip finished steps.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+ACE_COMMIT=ca1e85fe9430179831e6bc6be790c332190a3866
+echo "=== Phase 0: install ACE-Step ==="
+echo "Started: $(date)  Node: $(hostname)  GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)"
+df -h /srv/scratch/z5531827 | tail -1
+
+if [ ! -d "${ACESTEP_ROOT}/.git" ]; then
+    git clone https://github.com/ace-step/ACE-Step-1.5.git "${ACESTEP_ROOT}" || exit 1
+fi
+git -C "${ACESTEP_ROOT}" fetch -q origin && git -C "${ACESTEP_ROOT}" checkout -q ${ACE_COMMIT} || exit 1
+echo "ACE-Step at $(git -C "${ACESTEP_ROOT}" rev-parse HEAD)"
+
+if [ ! -x "${ACESTEP_PYTHON}" ]; then
+    # uv in a throwaway venv; its cache on node-local /tmp so scratch only holds the final venv
+    python3.11 -m venv "${TMPDIR}/uvenv" && "${TMPDIR}/uvenv/bin/pip" install -q uv || exit 1
+    cd "${ACESTEP_ROOT}"
+    UV_CACHE_DIR="${TMPDIR}/uvcache" UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never UV_PYTHON=$(which python3.11) \
+        "${TMPDIR}/uvenv/bin/uv" sync --frozen 2>&1 | tail -15
+    cd - >/dev/null
+fi
+"${ACESTEP_PYTHON}" -c "import torch, acestep; print('torch', torch.__version__, 'cuda ok:', torch.cuda.is_available())" || exit 1
+
+"${ACESTEP_PYTHON}" -c "
+from huggingface_hub import snapshot_download
+p = snapshot_download('ACE-Step/Ace-Step1.5', local_dir='${ACESTEP_CHECKPOINTS_DIR}',
+                      allow_patterns=['acestep-v15-turbo/*', 'vae/*', 'Qwen3-Embedding-0.6B/*', 'config.json'])
+print('weights in', p)
+" || exit 1
+ls "${ACESTEP_CHECKPOINTS_DIR}"
+
+echo "=== Smoke test: 1 song x 15 clips ==="
+cd ${REPO}
+"${ACESTEP_PYTHON}" -I scripts/phase0_generate.py --start 0 --count 1 --out-dir "${TMPDIR}/smoke" || exit 1
+"${ACESTEP_PYTHON}" -I -c "
+import json
+rows = [json.loads(l) for l in open('${TMPDIR}/smoke/params.jsonl')]
+print(len(rows), 'clips; generated', sum(r['generated'] for r in rows),
+      '; test 3.2 pass', sum(r.get('test_3_2', {}).get('pass', False) for r in rows),
+      '; planner metadata on', sum(bool(r.get('lm_metadata')) for r in rows),
+      '; seconds per clip', [r.get('seconds') for r in rows][:5])
+"
+echo "Sizes: venv $(du -sh ${ACESTEP_ROOT}/.venv | cut -f1), weights $(du -sh ${ACESTEP_CHECKPOINTS_DIR} | cut -f1)"
+df -h /srv/scratch/z5531827 | tail -1
+echo "Finished: $(date)"

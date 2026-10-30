@@ -1,0 +1,29 @@
+#!/bin/bash
+#PBS -N mw_p0_alm
+#PBS -l select=1:ncpus=8:mem=48gb:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# GPU job — Qwen2-Audio-7B listens to 12 listening-pack clips and names the lead instrument.
+# Needs >=24 GB VRAM (bf16). Bounces to another node if GPU is too small.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+
+BOUNCE=${BOUNCE:-0}
+echo "=== Phase 0: ALM listening ==="
+echo "Started: $(date)  Node: $(hostname)"
+
+GPU_GB=$(${PYTHON} -c "import torch; print(int(torch.cuda.get_device_properties(0).total_memory / 2**30))" 2>/dev/null || echo 0)
+echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null), ${GPU_GB} GB VRAM"
+if [ "$GPU_GB" -lt 24 ]; then
+    echo "GPU too small (${GPU_GB} GB < 24 GB). Requeuing..."
+    if [ "$BOUNCE" -lt 25 ]; then
+        qsub -v BOUNCE=$((BOUNCE+1)) ${REPO}/jobs/phase0/alm_listen.pbs
+    fi
+    exit 0
+fi
+
+${PYTHON} -I scripts/phase0_alm_listen.py || exit 1
+echo "Finished: $(date)"

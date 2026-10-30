@@ -1,0 +1,52 @@
+project:
+  name: MusicWhy
+  seed: 42
+  data_root: ./data
+  num_workers: 8
+
+audio:
+  sample_rate: 22050
+  max_duration: 600
+  formats:
+    - wav
+    - mp3
+    - flac
+    - ogg
+
+features:
+  mel_bands: 128
+  hop_lengths:
+    - 512
+    - 1024
+    - 2048
+  n_mfcc: 20
+  store_format: hdf5
+
+separation:
+  model: htdemucs
+  stems: 4
+  device: cuda
+
+annotation:
+  llm_provider: anthropic
+  llm_model: claude-sonnet-4-20250514
+  max_tokens: 2000
+  temperature: 0.3
+
+benchmark:
+  val_ratio: 0.1
+  test_ratio: 0.9
+  tasks:
+    - emotion_recognition
+    - genre_classification
+    - instrument_detection
+    - key_detection
+    - tempo_estimation
+    - structure_analysis
+
+evaluation:
+  models:
+    - claude-sonnet-4-20250514
+    - gpt-4o
+    - gemini-1.5-pro
+  judge_model: gpt-4o

@@ -1,0 +1,27 @@
+#!/bin/bash
+#PBS -N mw_p1_assemble
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — assembles training data from paraphrases + replay.
+# Requires: prepare.pbs (paraphrases + dose groups) and setup_env.pbs (alpaca download).
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+
+echo "=== Phase 1: Assemble Training Data ==="
+echo "Started: $(date)"
+
+REPLAY=${DATA_ROOT}/injection/alpaca_data_cleaned.json
+if [ ! -f "${REPLAY}" ]; then
+    echo "ERROR: Replay file not found. Run setup_env.pbs first."
+    exit 1
+fi
+
+${PYTHON} -I scripts/phase1_assemble.py || exit 1
+
+echo "=== Summary ==="
+wc -l ${DATA_ROOT}/injection/train.jsonl
+echo "Finished: $(date)"

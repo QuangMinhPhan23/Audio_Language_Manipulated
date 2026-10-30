@@ -1,0 +1,34 @@
+#!/bin/bash
+#PBS -N mw_p1_prepare
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — generates paraphrases, assigns dose groups, assembles training data.
+# Must run after setup_env.pbs (needs alpaca_data_cleaned.json).
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+
+echo "=== Phase 1: Prepare Training Data ==="
+echo "Started: $(date)"
+
+${PYTHON} -I scripts/phase1_paraphrase.py || exit 1
+echo "---"
+${PYTHON} -I scripts/phase1_build_eval.py || exit 1
+
+REPLAY=${DATA_ROOT}/injection/alpaca_data_cleaned.json
+if [ -f "${REPLAY}" ]; then
+    echo "---"
+    ${PYTHON} -I scripts/phase1_assemble.py || exit 1
+    echo "=== Summary ==="
+    wc -l ${DATA_ROOT}/injection/train.jsonl
+else
+    echo "Skipping assembly: replay file not yet downloaded (run setup_env.pbs first, then assemble.pbs)"
+fi
+
+echo "=== Summary ==="
+wc -l ${DATA_ROOT}/injection/paraphrases.jsonl
+python3 -c "import json; q=json.load(open('${DATA_ROOT}/injection/eval_questions.json')); print(f'Eval questions: {len(q)}')"
+echo "Finished: $(date)"

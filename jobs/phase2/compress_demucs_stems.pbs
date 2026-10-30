@@ -1,0 +1,64 @@
+#!/bin/bash
+#PBS -N mw_flac_stems
+#PBS -l select=1:ncpus=4:mem=8gb
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# CPU job — losslessly re-encodes Demucs output (data/stems/<tid>/*.wav, 16-bit PCM) as FLAC to free
+# ~10 GB of the 128 GB scratch quota. Each FLAC is decoded and compared sample-for-sample with its WAV
+# before the WAV is removed, so no audio changes. Resumable: already-converted stems are skipped.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+# Import from a node-local copy of the code: cold compute nodes block for minutes on each first
+# file open on scratch (see mw_stage_bundle in _env.sh)
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+
+echo "=== Phase 2B: compress Demucs stems to FLAC ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+du -sh ${DATA_ROOT}/stems
+
+${PYTHON} -S -c "
+import sys
+from pathlib import Path
+import numpy as np
+import soundfile as sf
+
+for stray in Path('${DATA_ROOT}/stems').glob('*/*.flac.part'):
+    stray.unlink()  # from a run that named temp files so soundfile couldn't read them back
+wavs = sorted(Path('${DATA_ROOT}/stems').glob('*/*.wav'))
+print(f'{len(wavs)} wav stems to convert', flush=True)
+done = mismatched = empty = 0
+for i, wav in enumerate(wavs, 1):
+    info = sf.info(str(wav))
+    if info.frames == 0:
+        empty += 1  # failed Demucs output; an empty FLAC would be a 0-byte unreadable file
+        continue
+    if info.subtype != 'PCM_16':
+        print(f'  skip {wav}: subtype {info.subtype} is not lossless in FLAC PCM_16', flush=True)
+        continue
+    audio, sr = sf.read(str(wav), dtype='int16', always_2d=True)
+    flac = wav.with_suffix('.flac')
+    part = wav.with_name(wav.stem + '.part.flac')  # soundfile picks the format from the extension
+    sf.write(str(part), audio, sr, format='FLAC', subtype='PCM_16')
+    back, sr2 = sf.read(str(part), dtype='int16', always_2d=True)
+    if sr2 != sr or not np.array_equal(back, audio):
+        mismatched += 1
+        part.unlink()
+        print(f'  MISMATCH {wav}; kept the wav', flush=True)
+        continue
+    part.replace(flac)
+    wav.unlink()
+    done += 1
+    if i % 50 == 0:
+        print(f'  {i}/{len(wavs)} converted', flush=True)
+print(f'Converted {done}, mismatched {mismatched}, left {empty} empty wavs as they are', flush=True)
+sys.exit(1 if mismatched else 0)
+"
+PY_STATUS=$?
+
+du -sh ${DATA_ROOT}/stems
+df -h /srv/scratch/z5531827 | tail -1
+echo "Finished: $(date)"
+exit ${PY_STATUS}

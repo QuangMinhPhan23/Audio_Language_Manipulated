@@ -1,0 +1,248 @@
+#!/bin/bash
+#PBS -N mw_embeddings
+#PBS -l select=1:ncpus=8:mem=48gb:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# GPU job — extracts MERT embeddings from all tracks, computes pairwise
+# cosine similarity, and saves top-k similar pairs for Task 3.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+cd ${REPO}
+
+BOUNCE=${BOUNCE:-0}
+# PAIRS_ONLY=1: embeddings already saved; rebuild similar_pairs.json on a CPU node (model never loads)
+PAIRS_ONLY=${PAIRS_ONLY:-0}
+
+echo "=== Phase 6: MERT Embedding Extraction (pairs_only=${PAIRS_ONLY}) ==="
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+
+# Guard: check GPU memory, requeue if too small
+if [ "${PAIRS_ONLY}" = "1" ]; then
+    GPU_GB=999
+else
+    GPU_GB=$(${PYTHON} -c "import torch; print(int(torch.cuda.get_device_properties(0).total_memory / 2**30))" 2>/dev/null || echo 0)
+    echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null), ${GPU_GB} GB VRAM"
+fi
+
+if [ "$GPU_GB" -lt 16 ]; then
+    echo "GPU too small (${GPU_GB} GB < 16 GB). Requeuing..."
+    if [ "$BOUNCE" -lt 25 ]; then
+        qsub -l walltime=02:00:00 -l select=1:ncpus=8:mem=48gb:ngpus=1 \
+            -v BOUNCE=$((BOUNCE+1)) \
+            ${REPO}/jobs/phase6/extract_embeddings.pbs
+    fi
+    exit 0
+fi
+
+${PYTHON} -I -c "
+import sys, json
+import numpy as np
+sys.path.insert(0, '.')
+from pathlib import Path
+
+data_root = Path('${DATA_ROOT}')
+
+# Output directories
+emb_dir = data_root / 'embeddings'
+emb_dir.mkdir(parents=True, exist_ok=True)
+feat_dir = data_root / 'features'
+
+# Load manifest
+from musicwhy.data.manifest import TrackManifest
+
+manifest = TrackManifest(data_root / 'manifest.csv')
+all_tracks = sorted(manifest.track_ids())
+print(f'Manifest: {len(all_tracks)} tracks', flush=True)
+
+# Load MERT model
+from musicwhy.evaluation.models import MERTWrapper
+
+model = MERTWrapper()
+print('MERT model loading...', flush=True)
+
+# Extract embeddings for each track
+embeddings = {}
+emb_file = emb_dir / 'mert_embeddings.npz'
+
+# Resume: load existing embeddings if present
+if emb_file.exists():
+    try:
+        existing = np.load(str(emb_file), allow_pickle=False)
+        for key in existing.files:
+            embeddings[key] = existing[key]
+        print(f'Resumed {len(embeddings)} existing embeddings', flush=True)
+    except Exception as e:
+        print(f'Could not load existing embeddings: {e}', flush=True)
+
+done = 0
+skipped = 0
+failed = 0
+
+for tid in all_tracks:
+    if tid in embeddings:
+        skipped += 1
+        continue
+
+    rec = manifest.get_track(tid)
+    if rec is None or not rec.file_path:
+        print(f'  SKIP {tid}: no file_path in manifest', flush=True)
+        failed += 1
+        continue
+
+    audio_path = Path(rec.file_path)
+    if not audio_path.exists():
+        print(f'  SKIP {tid}: file not found: {audio_path}', flush=True)
+        failed += 1
+        continue
+
+    try:
+        emb = model.get_embedding(str(audio_path))
+        embeddings[tid] = emb
+        done += 1
+        if done % 10 == 0:
+            print(f'  Extracted {done} new embeddings ({skipped} resumed, {failed} failed)', flush=True)
+            # Periodic save
+            np.savez_compressed(str(emb_file), **embeddings)
+    except Exception as e:
+        print(f'  FAILED {tid}: {e}', flush=True)
+        failed += 1
+
+# Final save of all embeddings
+np.savez_compressed(str(emb_file), **embeddings)
+print(f'Saved {len(embeddings)} embeddings to {emb_file}', flush=True)
+print(f'  New: {done}, Resumed: {skipped}, Failed: {failed}', flush=True)
+
+# ---------------------------------------------------------------
+# Compute pairwise cosine similarity
+# ---------------------------------------------------------------
+track_ids = sorted(k for k in embeddings if k in set(all_tracks))  # songs dropped from the manifest don't pair
+n = len(track_ids)
+print(f'Computing pairwise cosine similarity for {n} tracks...', flush=True)
+
+# Stack embeddings into a matrix
+emb_matrix = np.stack([embeddings[tid] for tid in track_ids])  # (n, D)
+
+# Standardize each dimension across the dataset before cosine similarity. Raw MERT vectors share a
+# large common component, so uncentred cosine put all 319 pairs between 0.90 and 0.98 and couldn't
+# tell a related pair from an unrelated one.
+emb_std = (emb_matrix - emb_matrix.mean(axis=0)) / (emb_matrix.std(axis=0) + 1e-8)
+norms = np.linalg.norm(emb_std, axis=1, keepdims=True)
+norms = np.where(norms == 0, 1.0, norms)
+emb_normed = emb_std / norms
+
+# Cosine similarity matrix
+sim_matrix = emb_normed @ emb_normed.T  # (n, n)
+off_diag = sim_matrix[~np.eye(n, dtype=bool)]
+print(f'Similarity spread: min {off_diag.min():.3f}, median {np.median(off_diag):.3f}, max {off_diag.max():.3f}', flush=True)
+
+# For each track, find top-3 most similar (excluding itself); also record 3 clearly dissimilar
+# tracks (bottom half of A's similarities) so Task 3 can ask which song is closest to A
+TOP_K = 3
+N_DISTRACTORS = 3
+rng = np.random.default_rng(42)
+from musicwhy.features.extract import FeatureExtractor
+
+similar_pairs = []
+seen_pairs = set()
+
+for i in range(n):
+    sims = sim_matrix[i].copy()
+    sims[i] = -1.0  # exclude self
+    top_indices = np.argsort(sims)[::-1][:TOP_K]
+
+    tid_a = track_ids[i]
+    rec_a = manifest.get_track(tid_a)
+
+    # Load features for song A
+    feat_a = {}
+    try:
+        feat_a = FeatureExtractor.load_features(tid_a, str(feat_dir))
+    except FileNotFoundError:
+        pass
+
+    for j in top_indices:
+        tid_b = track_ids[j]
+
+        # Deduplicate pairs (A,B) == (B,A)
+        pair_key = tuple(sorted([tid_a, tid_b]))
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+
+        rec_b = manifest.get_track(tid_b)
+        score = float(sims[j])
+
+        # Load features for song B
+        feat_b = {}
+        try:
+            feat_b = FeatureExtractor.load_features(tid_b, str(feat_dir))
+        except FileNotFoundError:
+            pass
+
+        # Per-frame arrays become their mean: full arrays for ~300 pairs OOM'd a 48 GB node,
+        # and Task 3 question text only uses summary values
+        def sanitize(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.item() if obj.size == 1 else float(np.mean(obj))
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, bytes):
+                return obj.decode('utf-8', 'replace')
+            if isinstance(obj, dict):
+                return {k: sanitize(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [sanitize(x) for x in obj]
+            return obj
+
+        pair = {
+            'song_a': {
+                'song_id': tid_a,
+                'title': rec_a.title if rec_a else '',
+                'artist': rec_a.artist if rec_a else '',
+                'audio_path': rec_a.file_path if rec_a else '',
+                'features': sanitize(feat_a),
+            },
+            'song_b': {
+                'song_id': tid_b,
+                'title': rec_b.title if rec_b else '',
+                'artist': rec_b.artist if rec_b else '',
+                'audio_path': rec_b.file_path if rec_b else '',
+                'features': sanitize(feat_b),
+            },
+            'similarity_score': score,
+            'similarity_rank': int(list(top_indices).index(j)) + 1,
+            'same_artist': bool(rec_a and rec_b and rec_a.artist == rec_b.artist and rec_a.artist != 'unknown'),
+            'distractors': [
+                {'song_id': track_ids[k], 'title': manifest.get_track(track_ids[k]).title,
+                 'artist': manifest.get_track(track_ids[k]).artist,
+                 'audio_path': manifest.get_track(track_ids[k]).file_path,
+                 'similarity_score': float(sims[k])}
+                for k in rng.choice([k for k in np.argsort(sims) if k != i][: max(N_DISTRACTORS, (n - 1) // 2)],
+                                    N_DISTRACTORS, replace=False)
+            ],
+        }
+        similar_pairs.append(pair)
+
+# Sort by similarity descending
+similar_pairs.sort(key=lambda p: p['similarity_score'], reverse=True)
+
+pairs_file = emb_dir / 'similar_pairs.json'
+with open(pairs_file, 'w') as f:
+    json.dump(similar_pairs, f, indent=2)
+
+print(f'Saved {len(similar_pairs)} unique similar pairs to {pairs_file}', flush=True)
+if similar_pairs:
+    top = similar_pairs[0]
+    print(f'  Top pair: {top[\"song_a\"][\"song_id\"]} <-> {top[\"song_b\"][\"song_id\"]} (sim={top[\"similarity_score\"]:.4f})', flush=True)
+"
+PY_STATUS=$?
+
+echo "=== Embeddings ==="
+ls -lh ${DATA_ROOT}/embeddings/ 2>/dev/null
+echo "Finished: $(date)"
+exit ${PY_STATUS}

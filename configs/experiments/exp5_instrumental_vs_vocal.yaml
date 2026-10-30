@@ -1,0 +1,48 @@
+# Experiment 5: Instrumental vs. Vocal Music Understanding
+# Compares LLM understanding performance on purely instrumental tracks
+# versus tracks with vocals, testing whether lyrics/vocal presence
+# influences music reasoning quality.
+
+experiment:
+  name: instrumental_vs_vocal
+  description: "Compare LLM music understanding on instrumental vs. vocal tracks"
+
+separation:
+  model: htdemucs
+  stems: 4
+  device: cuda
+  vocal_threshold: 0.01
+
+dataset:
+  categories:
+    - name: instrumental
+      min_tracks: 200
+      criteria: "No detectable vocals after source separation"
+    - name: vocal
+      min_tracks: 200
+      criteria: "Clear vocal presence in source separation"
+    - name: mixed
+      min_tracks: 100
+      criteria: "Intermittent vocal sections"
+
+evaluation:
+  models:
+    - claude-sonnet-4-20250514
+    - gpt-4o
+    - gemini-1.5-pro
+  tasks:
+    - emotion_recognition
+    - genre_classification
+    - structure_analysis
+    - key_detection
+    - tempo_estimation
+  metrics:
+    - accuracy
+    - f1_macro
+    - response_quality_score
+
+annotation:
+  llm_provider: anthropic
+  llm_model: claude-sonnet-4-20250514
+  max_tokens: 2000
+  temperature: 0.3
