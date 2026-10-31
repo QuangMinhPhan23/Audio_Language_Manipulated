@@ -423,7 +423,7 @@ def test_done_criteria_coverage():
 # ===========================================================================
 
 def test_v2_constants():
-    assert len(design.INSTRUMENTS_V2) == 6
+    assert len(design.INSTRUMENTS_V2) == 7
     assert set(design.VALUES_V2["vocals"]) == {"vocal", "instrumental"}
     assert set(design.VALUES_V2["mode"]) == {"major", "minor"}
     assert set(design.VALUES_V2["tempo_band"]) == {"slow", "medium", "fast"}
@@ -524,17 +524,17 @@ def test_eval_arms_evidence_order_varies():
 def test_stems_classify():
     """Stem classification maps MoisesDB names to our categories."""
     from musicwhy.stimuli.stems import classify_stem
-    assert classify_stem({"stemName": "Piano"}) == "piano"
-    assert classify_stem({"stemName": "Bowed Strings"}) == "strings"
-    assert classify_stem({"stemName": "Vocals"}) is None
-    assert classify_stem({"stemName": "Bass"}) is None
-    assert classify_stem({"stemName": "Drums"}) is None
-    assert classify_stem({"stemName": "Guitar"}) == "electric guitar"
-    assert classify_stem({"stemName": "Guitar",
+    assert classify_stem({"stemName": "piano"}) == "piano"
+    assert classify_stem({"stemName": "bowed_strings"}) == "strings"
+    assert classify_stem({"stemName": "vocals"}) is None
+    assert classify_stem({"stemName": "bass"}) is None
+    assert classify_stem({"stemName": "drums"}) is None
+    assert classify_stem({"stemName": "guitar"}) == "electric guitar"
+    assert classify_stem({"stemName": "guitar",
                           "tracks": [{"trackType": "Acoustic Guitar"}]}) == "acoustic guitar"
-    assert classify_stem({"stemName": "Other Keys",
+    assert classify_stem({"stemName": "other_keys",
                           "tracks": [{"trackType": "Organ"}]}) == "organ"
-    assert classify_stem({"stemName": "Other Keys"}) == "synthesizer"
+    assert classify_stem({"stemName": "other_keys"}) == "synthesizer"
 
 
 # ===========================================================================

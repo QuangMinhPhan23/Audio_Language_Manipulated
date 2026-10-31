@@ -13,7 +13,7 @@ import zlib
 from typing import Any, Dict, List, Optional
 
 INSTRUMENTS = ["piano", "electric guitar", "saxophone", "synthesizer", "violin", "trumpet"]
-INSTRUMENTS_V2 = ["piano", "electric guitar", "acoustic guitar", "synthesizer", "strings", "organ"]
+INSTRUMENTS_V2 = ["piano", "electric guitar", "acoustic guitar", "synthesizer", "strings", "organ", "wind"]
 # Inside ACE-Step's stable range; its docs warn that extreme tempos are unstable
 TEMPO_BANDS = {"slow": (70, 85), "medium": (100, 115), "fast": (130, 145)}
 MODES = ["major", "minor"]

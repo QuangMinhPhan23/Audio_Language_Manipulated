@@ -36,11 +36,17 @@ def _save_jsonl(rows, path):
 
 
 def _open_zip():
+    """Open MoisesDB zip — local path (MOISESDB_ZIP) or remote URL (MOISESDB_URL, ~83 GB, streamed via HTTP Range)."""
     import zipfile
     zpath = os.environ.get("MOISESDB_ZIP", "")
-    if not zpath or not Path(zpath).exists():
-        sys.exit(f"Set MOISESDB_ZIP to the MoisesDB zip path (got: {zpath!r})")
-    return zipfile.ZipFile(zpath)
+    if zpath and Path(zpath).exists():
+        return zipfile.ZipFile(zpath)
+    url = os.environ.get("MOISESDB_URL", "")
+    if url:
+        from musicwhy.data.remote_zip import open_remote_zip
+        print(f"Opening remote zip: {url[:60]}...", flush=True)
+        return open_remote_zip(url)
+    sys.exit("Set MOISESDB_ZIP (local path) or MOISESDB_URL (remote link from music.ai/research)")
 
 
 def step_count():
@@ -115,7 +121,7 @@ def step_windows():
                 if lead_audio is None or len(lead_audio) < SR * 20:
                     continue
 
-                vocal_audio = load_stem_audio(zf, "Vocals", data_json, SR)
+                vocal_audio = load_stem_audio(zf, "vocals", data_json, SR)
 
                 wins = find_windows(lead_audio, SR, vocal_audio=vocal_audio)
                 for wi, (start, end) in enumerate(wins):
@@ -192,11 +198,11 @@ def step_render():
         drums, bass, vocals = None, None, None
         for stem in data_json.get("stems", []):
             sn = stem.get("stemName", "")
-            if sn == "Drums":
+            if sn == "drums":
                 drums = load_stem_audio(zf, sn, data_json, SR)
-            elif sn == "Bass":
+            elif sn == "bass":
                 bass = load_stem_audio(zf, sn, data_json, SR)
-            elif sn == "Vocals":
+            elif sn == "vocals":
                 vocals = load_stem_audio(zf, sn, data_json, SR)
 
         stems = {"lead": lead, "drums": drums, "bass": bass, "vocals": vocals}

@@ -28,21 +28,21 @@ RECON_TOL_DB = -60.0
 # name to distinguish acoustic from electric, so we also check tracks[].trackType when present.
 
 STEM_TO_INSTRUMENT: Dict[str, str] = {
-    "Piano": "piano",
-    "Guitar": "electric guitar",       # default; overridden to acoustic guitar per-track
-    "Other Keys": "synthesizer",        # default; overridden to organ per-track
-    "Bowed Strings": "strings",
-    "Wind": "wind",
+    "piano": "piano",
+    "guitar": "electric guitar",        # default; overridden to acoustic guitar per-track
+    "other_keys": "synthesizer",        # default; overridden to organ per-track
+    "bowed_strings": "strings",
+    "wind": "wind",
 }
 
 # Track-level overrides: (stemName, trackType substring) → instrument
 TRACK_OVERRIDES: List[Tuple[str, str, str]] = [
-    ("Guitar", "Acoustic", "acoustic guitar"),
-    ("Other Keys", "Organ", "organ"),
-    ("Other Keys", "Electric Organ", "organ"),
+    ("guitar", "acoustic", "acoustic guitar"),
+    ("other_keys", "organ", "organ"),
+    ("other_keys", "electric organ", "organ"),
 ]
 
-NON_MELODIC = {"Vocals", "Bass", "Drums"}
+NON_MELODIC = {"vocals", "bass", "drums"}
 
 MIN_SONGS_PER_INSTRUMENT = 25
 
