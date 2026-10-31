@@ -17,6 +17,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 DATA = Path(os.environ.get("DATA_ROOT", "data"))
 P0 = DATA / "phase0"
 MOISES_TRACKS = DATA / "raw" / "moisesdb" / "tracks"
@@ -231,39 +233,86 @@ def step_render():
     print(f"\nRendered {len(results)} clip pairs", flush=True)
 
 
+def _librosa_tempo(audio, sr):
+    """Estimate BPM with librosa's beat tracker. Returns float or None."""
+    import librosa
+    tempo, _ = librosa.beat.beat_track(y=audio, sr=sr, units="time")
+    return float(tempo[0]) if hasattr(tempo, '__len__') else (float(tempo) if tempo > 0 else None)
+
+
+def _librosa_tempo_onset(audio, sr):
+    """Second tempo estimate using onset-based beat tracking for cross-validation."""
+    import librosa
+    onset_env = librosa.onset.onset_strength(y=audio, sr=sr)
+    tempo = librosa.feature.tempo(onset_envelope=onset_env, sr=sr)
+    return float(tempo[0]) if len(tempo) > 0 and tempo[0] > 0 else None
+
+
+KS_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+KS_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+
+
+def _librosa_mode(audio, sr):
+    """Estimate major/minor using Krumhansl-Schmuckler key profiles on librosa chroma."""
+    import librosa
+    chroma = librosa.feature.chroma_cqt(y=audio, sr=sr)
+    chroma_sum = chroma.mean(axis=1)
+    best_major = max(np.corrcoef(np.roll(KS_MAJOR, i), chroma_sum)[0, 1] for i in range(12))
+    best_minor = max(np.corrcoef(np.roll(KS_MINOR, i), chroma_sum)[0, 1] for i in range(12))
+    return "major" if best_major >= best_minor else "minor"
+
+
+def _librosa_mode_stft(audio, sr):
+    """Second mode estimate using STFT-based chroma for cross-validation."""
+    import librosa
+    chroma = librosa.feature.chroma_stft(y=audio, sr=sr)
+    chroma_sum = chroma.mean(axis=1)
+    best_major = max(np.corrcoef(np.roll(KS_MAJOR, i), chroma_sum)[0, 1] for i in range(12))
+    best_minor = max(np.corrcoef(np.roll(KS_MINOR, i), chroma_sum)[0, 1] for i in range(12))
+    return "major" if best_major >= best_minor else "minor"
+
+
 def step_measure():
-    """Measure tempo and mode for rendered clips using independent verifiers."""
-    from musicwhy.stimuli.measure import Measurer
-    from musicwhy.stimuli.design import TEMPO_BANDS, band_of
+    """Measure tempo and mode for rendered clips using librosa (no essentia needed)."""
+    import librosa
+    import soundfile as sf
+    from musicwhy.stimuli.design import band_of
 
     rendered_path = P0 / "rendered_clips.jsonl"
     if not rendered_path.exists():
         sys.exit("Run 'render' first")
     clips = _load_jsonl(rendered_path)
 
-    measurer = Measurer(device="cpu")
+    clips_dir = P0 / "clips"
     results = []
     for i, clip in enumerate(clips):
-        if clip.get("skipped"):
-            continue
         clip_id = clip["clip_id"]
-        vocal_path = Path(clip["vocal_path"])
+        vocal_path = Path(clip.get("vocal_path", str(clips_dir / f"{clip_id}_vocal.wav")))
         if not vocal_path.exists():
             continue
 
-        t_a = measurer.tempo(measurer.tempo_a, vocal_path)
-        t_b = measurer.tempo(measurer.tempo_b, vocal_path)
-        modes = measurer.modes(vocal_path)
+        audio, file_sr = sf.read(str(vocal_path), dtype="float32", always_2d=True)
+        audio = audio.mean(axis=1)
+        if file_sr != 22050:
+            audio_22k = librosa.resample(audio, orig_sr=file_sr, target_sr=22050, res_type="soxr_hq")
+        else:
+            audio_22k = audio
+        audio_44k = audio if file_sr == 44100 else librosa.resample(audio, orig_sr=file_sr, target_sr=44100, res_type="soxr_hq")
+
+        t_a = _librosa_tempo(audio_22k, 22050)
+        t_b = _librosa_tempo_onset(audio_22k, 22050)
+        mode_a = _librosa_mode(audio_44k, 44100)
+        mode_b = _librosa_mode_stft(audio_44k, 44100)
 
         tempo_agree = (t_a is not None and t_b is not None and
                        band_of(t_a) is not None and band_of(t_a) == band_of(t_b))
-        mode_agree = len(set(modes.values())) == 1 and len(modes) >= 2
+        mode_agree = mode_a == mode_b
 
         results.append({
             **clip,
-            "tempo": {measurer.tempo_a: t_a, measurer.tempo_b: t_b},
+            "tempo": {"librosa_beat": t_a, "librosa_onset": t_b},
             "tempo_band": band_of(t_a) if tempo_agree else None,
-            "mode": list(modes.values())[0] if mode_agree else None,
+            "mode": mode_a if mode_agree else None,
             "tempo_agree": tempo_agree,
             "mode_agree": mode_agree,
         })

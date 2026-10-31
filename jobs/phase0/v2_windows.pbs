@@ -7,7 +7,8 @@
 
 # v2 Step 2: find active 20s windows for each track+instrument. Reads audio from the zip, computes
 # per-frame RMS to check activity thresholds. Writes: data/phase0/windows.jsonl
-# Needs numpy + soundfile (in sp_bundle).
+# Set MOISESDB_URL in ~/.musicwhy_secrets or MOISESDB_ZIP for a local zip.
+# Needs numpy + soundfile (in sp_bundle). ~240 tracks × audio reads; remote zip may take ~1 h.
 
 source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
 
@@ -15,6 +16,5 @@ echo "=== v2 Step 2: find windows ==="
 echo "Started: $(date)  Node: $(hostname)"
 mw_stage_bundle || exit 1
 cd ${CODE_ROOT}
-export MOISESDB_ZIP=${MOISESDB_ZIP:-/srv/scratch/z5531827/musicwhy/data/raw/moisesdb.zip}
 ${PYTHON} -I ${CODE_ROOT}/scripts/phase0v2_stems.py windows || exit 1
 echo "Finished: $(date)"

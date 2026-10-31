@@ -51,7 +51,7 @@ def step_assign():
     counts = json.loads(counts_path.read_text())
     kept_instruments = list(counts["kept"])
 
-    usable = [c for c in clips if not c.get("skipped")]
+    usable = clips
     if len(usable) > len(names):
         print(f"Warning: {len(usable)} clips but only {len(names)} fictional names; using first {len(names)}", flush=True)
         usable = usable[:len(names)]

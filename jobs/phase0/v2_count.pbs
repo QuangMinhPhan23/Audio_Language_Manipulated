@@ -5,9 +5,10 @@
 #PBS -j oe
 #PBS -M z5531827@unsw.edu.au
 
-# v2 Step 1: count melodic stems per instrument in MoisesDB. Reads from the zip file.
+# v2 Step 1: count melodic stems per instrument in MoisesDB. Reads data.json entries from the zip.
 # Writes: data/phase0/stem_inventory.jsonl, data/phase0/stem_counts.json
-# CPU-only, stdlib-only except JSON parsing. Should finish in minutes.
+# Set MOISESDB_URL in ~/.musicwhy_secrets (link from music.ai/research) or MOISESDB_ZIP for a local zip.
+# CPU-only, stdlib JSON parsing. Finishes in minutes (remote) or seconds (local).
 
 source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
 
@@ -15,6 +16,5 @@ echo "=== v2 Step 1: stem count ==="
 echo "Started: $(date)  Node: $(hostname)"
 mw_stage_bundle || exit 1
 cd ${CODE_ROOT}
-export MOISESDB_ZIP=${MOISESDB_ZIP:-/srv/scratch/z5531827/musicwhy/data/raw/moisesdb.zip}
 ${PYTHON} -I ${CODE_ROOT}/scripts/phase0v2_stems.py count || exit 1
 echo "Finished: $(date)"
