@@ -1,7 +1,11 @@
-"""Attribute design for the 500 fictional songs and the clips made for each (PHASE0_stimuli_pipeline.md §1, §3).
+"""Attribute design for fictional songs (PHASE0_stimuli_pipeline.md §1).
 
 Stdlib only. Every random choice is seeded from the song id, so rebuilding gives the same songs, conflict
 values and generation seeds.
+
+v1 instruments (ACE-Step/MIDI): piano, electric guitar, saxophone, synthesizer, violin, trumpet
+v2 instruments (real MoisesDB stems): piano, electric guitar, acoustic guitar, synthesizer, strings, organ
+   — final set fixed after step 1 stem counts; any value with < 25 songs is dropped.
 """
 import itertools
 import random
@@ -9,12 +13,14 @@ import zlib
 from typing import Any, Dict, List, Optional
 
 INSTRUMENTS = ["piano", "electric guitar", "saxophone", "synthesizer", "violin", "trumpet"]
+INSTRUMENTS_V2 = ["piano", "electric guitar", "acoustic guitar", "synthesizer", "strings", "organ"]
 # Inside ACE-Step's stable range; its docs warn that extreme tempos are unstable
 TEMPO_BANDS = {"slow": (70, 85), "medium": (100, 115), "fast": (130, 145)}
 MODES = ["major", "minor"]
 VOCALS = ["instrumental", "vocal"]
 ATTRIBUTES = ("lead_instrument", "tempo_band", "mode", "vocals")
 VALUES = {"lead_instrument": INSTRUMENTS, "tempo_band": list(TEMPO_BANDS), "mode": MODES, "vocals": VOCALS}
+VALUES_V2 = {"lead_instrument": INSTRUMENTS_V2, "tempo_band": list(TEMPO_BANDS), "mode": MODES, "vocals": VOCALS}
 # ACE-Step's VALID_KEYSCALES are "<note><accidental> <major|minor>" (acestep/constants.py)
 TONICS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 

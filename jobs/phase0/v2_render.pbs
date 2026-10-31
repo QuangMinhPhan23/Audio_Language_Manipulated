@@ -1,0 +1,21 @@
+#!/bin/bash
+#PBS -N mw_v2_render
+#PBS -l select=1:ncpus=4:mem=32gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# v2 Step 3: render sparse mixes (lead + drums + bass ± vocals) for each window.
+# Reads from the zip, writes WAV clips to data/phase0/clips/.
+# Also writes data/phase0/rendered_clips.jsonl with metadata.
+# Needs numpy + soundfile. Writes to scratch (not node-local /tmp) since clips are large.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+
+echo "=== v2 Step 3: render sparse mixes ==="
+echo "Started: $(date)  Node: $(hostname)"
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+export MOISESDB_ZIP=${MOISESDB_ZIP:-/srv/scratch/z5531827/musicwhy/data/raw/moisesdb.zip}
+${PYTHON} -I ${CODE_ROOT}/scripts/phase0v2_stems.py render || exit 1
+echo "Finished: $(date)"

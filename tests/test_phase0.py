@@ -9,6 +9,7 @@ from musicwhy.stimuli import design, names
 from musicwhy.stimuli.acceptance import (THRESHOLDS, accept, instrument_votes,
                                         majority_instrument, tempo_match)
 from musicwhy.stimuli.measure import bpm_from_beats, clip_properties
+from musicwhy.stimuli.facts import assign_facts, facts_summary, assign_doses
 
 DATA = Path(os.environ.get("DATA_ROOT", "data"))
 P0 = DATA / "phase0"
@@ -415,3 +416,187 @@ def test_done_criteria_coverage():
     for attr in design.ATTRIBUTES:
         n = len(conflict_by_attr.get(attr, set()))
         assert n >= 500, f"{500 - n} songs missing {attr} conflict clips"
+
+
+# ===========================================================================
+# Phase 0 v2 — unit tests (run anywhere, no data needed)
+# ===========================================================================
+
+def test_v2_constants():
+    assert len(design.INSTRUMENTS_V2) == 6
+    assert set(design.VALUES_V2["vocals"]) == {"vocal", "instrumental"}
+    assert set(design.VALUES_V2["mode"]) == {"major", "minor"}
+    assert set(design.VALUES_V2["tempo_band"]) == {"slow", "medium", "fast"}
+
+
+def test_facts_balance_4_attrs():
+    """Each song with all 4 known attributes gets exactly 2 agree + 2 conflict."""
+    instruments = ["piano", "electric guitar", "acoustic guitar", "synthesizer"]
+    songs = [{"song_id": f"t{i}", "lead_instrument": instruments[i % 4],
+              "vocals": "vocal", "tempo_band": "slow", "mode": "major"} for i in range(100)]
+    facts = assign_facts(songs, seed=42, instrument_values=instruments)
+    by_song = {}
+    for f in facts:
+        by_song.setdefault(f["song_id"], {"agree": 0, "conflict": 0})
+        by_song[f["song_id"]][f["arm"]] += 1
+    for sid, counts in by_song.items():
+        assert counts["agree"] == 2 and counts["conflict"] == 2, f"{sid}: {counts}"
+
+
+def test_facts_balance_per_attribute():
+    """Each attribute is roughly 50/50 agree/conflict across all songs."""
+    instruments = ["piano", "electric guitar", "acoustic guitar"]
+    songs = [{"song_id": f"t{i}", "lead_instrument": instruments[i % 3],
+              "vocals": ["vocal", "instrumental"][i % 2],
+              "tempo_band": ["slow", "medium", "fast"][i % 3],
+              "mode": ["major", "minor"][i % 2]} for i in range(200)]
+    facts = assign_facts(songs, seed=0, instrument_values=instruments)
+    summary = facts_summary(facts)
+    for attr, counts in summary["per_attr"].items():
+        total = counts["agree"] + counts["conflict"]
+        ratio = counts["agree"] / total
+        assert 0.35 < ratio < 0.65, f"{attr}: agree ratio {ratio:.2f} not near 0.5"
+
+
+def test_facts_conflict_value_differs():
+    """Conflict facts always inject a different value than the true one."""
+    instruments = ["piano", "electric guitar", "synthesizer"]
+    songs = [{"song_id": f"t{i}", "lead_instrument": instruments[i % 3],
+              "vocals": "vocal", "tempo_band": "medium", "mode": "major"} for i in range(50)]
+    facts = assign_facts(songs, seed=0, instrument_values=instruments)
+    for f in facts:
+        if f["arm"] == "conflict":
+            assert f["injected_value"] != f["true_value"], f
+
+
+def test_facts_skips_none_attributes():
+    """Songs with None tempo/mode get fewer than 4 facts."""
+    songs = [{"song_id": "t0", "lead_instrument": "piano",
+              "vocals": "vocal", "tempo_band": None, "mode": None}]
+    facts = assign_facts(songs, seed=0, instrument_values=["piano", "guitar"])
+    assert len(facts) == 2  # only instrument + vocals
+
+
+def test_dose_balance():
+    """Doses are balanced across instruments."""
+    instruments = ["piano", "guitar", "synth"]
+    songs = [{"song_id": f"t{i}", "lead_instrument": instruments[i % 3]}
+             for i in range(75)]
+    mapping = assign_doses(songs, doses=[0, 10, 100], seed=0)
+    assert len(mapping) == 75
+    by_dose = {}
+    for d in mapping.values():
+        by_dose[d] = by_dose.get(d, 0) + 1
+    assert all(20 <= n <= 30 for n in by_dose.values()), by_dose
+
+
+def test_eval_arms_no_fake_options():
+    """Mode and vocals use only their real values (2-way), not padded fakes."""
+    from musicwhy.injection.eval_arms import _mc_options
+    opts_mode, _, n_mode = _mc_options("mode", "major", seed=42)
+    assert n_mode == 2
+    assert all(v in ("major", "minor") for v in opts_mode.values())
+    opts_voc, _, n_voc = _mc_options("vocals", "vocal", seed=42)
+    assert n_voc == 2
+
+
+def test_eval_arms_instrument_uses_all_values():
+    """Instrument questions use all real values."""
+    from musicwhy.injection.eval_arms import _mc_options
+    opts, _, n = _mc_options("lead_instrument", "piano", seed=42)
+    assert n == len(design.INSTRUMENTS)
+
+
+def test_eval_arms_evidence_order_varies():
+    """The T arm randomises evidence-before vs evidence-after the question."""
+    from musicwhy.injection.eval_arms import build_eval_questions
+    songs = [{"song_id": f"t{i}", "title": f"Song {i}", "artist": f"Artist {i}",
+              "lead_instrument": "piano", "tempo_band": "slow", "mode": "major",
+              "vocals": "vocal"} for i in range(100)]
+    dose_map = {s["song_id"]: 0 for s in songs}
+    qs = build_eval_questions(songs, dose_map)
+    t_qs = [q for q in qs if q["arm"] == "T"]
+    starts_with_evidence = sum(1 for q in t_qs if q["prompt"].startswith("I recently"))
+    assert 100 < starts_with_evidence < len(t_qs) - 100, \
+        f"evidence order not randomised: {starts_with_evidence}/{len(t_qs)} start with evidence"
+
+
+def test_stems_classify():
+    """Stem classification maps MoisesDB names to our categories."""
+    from musicwhy.stimuli.stems import classify_stem
+    assert classify_stem({"stemName": "Piano"}) == "piano"
+    assert classify_stem({"stemName": "Bowed Strings"}) == "strings"
+    assert classify_stem({"stemName": "Vocals"}) is None
+    assert classify_stem({"stemName": "Bass"}) is None
+    assert classify_stem({"stemName": "Drums"}) is None
+    assert classify_stem({"stemName": "Guitar"}) == "electric guitar"
+    assert classify_stem({"stemName": "Guitar",
+                          "tracks": [{"trackType": "Acoustic Guitar"}]}) == "acoustic guitar"
+    assert classify_stem({"stemName": "Other Keys",
+                          "tracks": [{"trackType": "Organ"}]}) == "organ"
+    assert classify_stem({"stemName": "Other Keys"}) == "synthesizer"
+
+
+# ===========================================================================
+# Phase 0 v2 — data-validation tests (skip when outputs absent)
+# ===========================================================================
+
+@pytest.mark.skipif(not (P0 / "stem_counts.json").exists(), reason="stem counts not generated yet")
+def test_v2_1_stem_counts():
+    """Test v2.1: every kept instrument value has >= 25 songs."""
+    counts = json.loads((P0 / "stem_counts.json").read_text())
+    for inst, n in counts["kept"].items():
+        assert n >= 25, f"v2.1: {inst} has {n} songs, need >= 25"
+
+
+@pytest.mark.skipif(not (P0 / "rendered_clips.jsonl").exists(), reason="clips not rendered yet")
+def test_v2_2_clip_activity():
+    """Test v2.2: rendered clips meet activity and loudness thresholds."""
+    clips = _load_jsonl(P0 / "rendered_clips.jsonl")
+    rendered = [c for c in clips if not c.get("skipped")]
+    if not rendered:
+        pytest.skip("no rendered clips yet")
+    for c in rendered[:20]:
+        vocal_path = Path(c.get("vocal_path", ""))
+        inst_path = Path(c.get("instrumental_path", ""))
+        for p in (vocal_path, inst_path):
+            if p.exists():
+                import soundfile as sf
+                audio, sr = sf.read(str(p), dtype="float32")
+                assert len(audio) / sr >= 19.5, f"{p.name}: too short ({len(audio)/sr:.1f}s)"
+
+
+@pytest.mark.skipif(not (P0 / "facts.jsonl").exists(), reason="facts not generated yet")
+def test_v2_3_facts_balance():
+    """Test v2.3: 2 agree + 2 conflict per song (where all 4 attrs known); 50/50 per attribute."""
+    facts = _load_jsonl(P0 / "facts.jsonl")
+    if not facts:
+        pytest.skip("facts.jsonl is empty")
+    summary = facts_summary(facts)
+    for attr, counts in summary["per_attr"].items():
+        total = counts["agree"] + counts["conflict"]
+        if total == 0:
+            continue
+        ratio = counts["agree"] / total
+        assert 0.40 < ratio < 0.60, f"v2.3: {attr} agree ratio {ratio:.2f} not near 0.5"
+
+    v2_songs_path = P0 / "v2_songs.jsonl"
+    if v2_songs_path.exists():
+        songs = _load_jsonl(v2_songs_path)
+        counts_path = P0 / "stem_counts.json"
+        if counts_path.exists():
+            counts = json.loads(counts_path.read_text())
+            dose_map = {}
+            for s in songs:
+                if "dose" in s:
+                    dose_map.setdefault(s["dose"], {}).setdefault(
+                        s["lead_instrument"], 0)
+                    dose_map[s["dose"]][s["lead_instrument"]] += 1
+
+
+@pytest.mark.skipif(not (P0 / "phase0_report.md").exists(), reason="report not generated yet")
+def test_v2_4_hearing_gate():
+    """Test v2.4: hearing gate numbers recorded in phase0_report.md."""
+    text = (P0 / "phase0_report.md").read_text()
+    assert "instrument" in text.lower() and "vocal" in text.lower(), \
+        "v2.4: phase0_report.md must contain hearing gate results"

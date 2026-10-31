@@ -1,0 +1,21 @@
+#!/bin/bash
+#PBS -N mw_v2_assign
+#PBS -l select=1:ncpus=2:mem=8gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# v2 Steps 4-5: attach fictional names, assign doses, generate agree/conflict facts.
+# STEP is "assign" (step 4) or "facts" (step 5). Run assign first.
+# Reads: data/phase0/measured_clips.jsonl, data/phase0/songs.jsonl, data/phase0/stem_counts.json
+# Writes: data/phase0/v2_songs.jsonl (assign), data/phase0/facts.jsonl (facts)
+# CPU-only, stdlib-only. Finishes in seconds.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+
+echo "=== v2 Steps 4-5: ${STEP:?set STEP to assign or facts} ==="
+echo "Started: $(date)  Node: $(hostname)"
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+${PYTHON} -I ${CODE_ROOT}/scripts/phase0v2_assign.py ${STEP} || exit 1
+echo "Finished: $(date)"

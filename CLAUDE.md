@@ -2,7 +2,8 @@
 
 **Read `docs/RESEARCH_REQUIREMENTS.md` first.** It holds the current goal (A* main track: dose-controlled injected
 memory vs audio evidence), the prior-work list and the do-not-claim list, and it supersedes the research goal
-below. Current build step: `docs/PHASE0_stimuli_pipeline.md`. Both files are the canonical specs for the project.
+below. Current build step: `docs/PHASE0_v2_real_stems.md` (supersedes §3-§4 of `docs/PHASE0_stimuli_pipeline.md`).
+Both files are the canonical specs for the project.
 
 ## Research goal (for ARIS skills)
 

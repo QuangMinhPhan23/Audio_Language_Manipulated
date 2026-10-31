@@ -1,0 +1,19 @@
+#!/bin/bash
+#PBS -N mw_v2_measure
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -M z5531827@unsw.edu.au
+
+# v2 Step 3b: measure tempo and mode for rendered clips using independent verifiers.
+# Reads data/phase0/rendered_clips.jsonl + WAV clips, writes data/phase0/measured_clips.jsonl.
+# CPU-bound (librosa beat tracking, key estimation). No GPU needed.
+
+source /srv/scratch/z5531827/musicwhy/scripts/_env.sh
+
+echo "=== v2 Step 3b: measure tempo/mode ==="
+echo "Started: $(date)  Node: $(hostname)"
+mw_stage_bundle || exit 1
+cd ${CODE_ROOT}
+${PYTHON} -I ${CODE_ROOT}/scripts/phase0v2_stems.py measure || exit 1
+echo "Finished: $(date)"
